@@ -60,12 +60,34 @@ Rules:
 After the </head>, output a line "LANG:" followed by the page's language code (BCP 47, e.g. "en",
 "zh-CN", "ja") inferred from its content.
 
-Then output a line "STYLE:" followed by a single <style>...</style> block with clean,
-modern, responsive CSS that improves the page's typography, spacing, colors and layout WITHOUT changing
-any content. Prefer a small design system: CSS variables for a readable color palette, a comfortable
-font stack, generous line-height, a max-width container for the main text, and sensible styles for
-headings / links / images / lists / tables / forms / code. Do NOT rewrite any text or links; only add
-CSS. Keep it self-contained.
+Then output a line "STYLE:" followed by a single <style>...</style> block that gives the page a
+polished, cohesive, magazine-quality look. Add CSS ONLY — never rewrite or add text, links, or content.
+
+Design requirements (aim high — a generic bare "article" look is not acceptable):
+1. Content awareness — decide what kind of page this is (product/e-commerce, article/blog, landing
+   page, documentation, dashboard, gallery, form, directory, etc.) and design FOR it. A storefront
+   needs cards, a hero, and price/product emphasis; an article needs a comfortable reading measure;
+   a landing page needs a strong above-the-fold. Tailor the container width to the type (a wide,
+   centered container or a responsive card grid for catalogs; a narrower measure only for long-form
+   reading) — do NOT force every page into a narrow single column.
+2. System, not one-offs — define a :root design-token set: a refined palette (one strong accent +
+   neutral grays, with light/dark variants), a font stack (system-ui + a CJK fallback), a spacing
+   scale, 2–3 radii, and layered subtle shadows. Reuse the tokens everywhere.
+3. Typography — a clear hierarchy: larger, heavier headings with tight leading; comfortable body size
+   (16–18px) and line-height (1.6–1.75); muted secondary text; distinct link styling.
+4. Layout — center content in a responsive container, generous vertical rhythm between sections, and
+   a responsive card grid (auto-fill minmax) for repeated items like products/articles/features.
+5. Components — style nav/header, hero, cards, buttons, badges/chips, tables, forms (inputs,
+   textareas, selects, buttons), images (max-width, rounded), lists, blockquote, and code/pre so they
+   read as one coherent system. Cards: radius + subtle shadow + gentle hover lift. Buttons: solid
+   primary + hover/active states + a visible focus ring.
+6. Interaction & polish — 150–200ms transitions on hover/focus, a visible :focus-visible outline,
+   and a @media (prefers-color-scheme: dark) block so it looks good in both light and dark modes.
+7. Responsive — mobile-first, fluid type via clamp(), and collapse multi-column layouts to a single
+   column below ~720px.
+
+Keep the CSS self-contained, dependency-free, and as compact as you can while meeting the above.
+Output nothing but the single <style>...</style> block.
 
 Then output a single line "ALTS:" followed by a JSON array of alt-text suggestions
 for images that currently lack a meaningful alt attribute (derive each from its context / surrounding
@@ -243,6 +265,89 @@ def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> 
 
 # ============ Rule fallback: deterministic minimal fixes ============
 
+# Injected when the page has no <style> of its own, so the no-LLM fallback is still pleasant to read.
+DEFAULT_STYLESHEET = """\
+:root {
+  --bg: #ffffff; --bg-soft: #f7f7f8; --bg-muted: #eef0f3;
+  --fg: #17181c; --fg-muted: #5c5f66;
+  --accent: #4f46e5; --accent-strong: #4338ca; --accent-soft: #eef2ff;
+  --border: #e5e7eb; --success: #16a34a; --danger: #dc2626;
+  --radius-sm: 8px; --radius: 14px; --radius-lg: 20px;
+  --shadow-sm: 0 1px 2px rgba(17, 24, 39, .05);
+  --shadow: 0 4px 14px rgba(17, 24, 39, .07);
+  --shadow-lg: 0 16px 40px rgba(17, 24, 39, .12);
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+body {
+  margin: 0; font-family: var(--font); font-size: 16px; line-height: 1.7;
+  color: var(--fg); background: var(--bg);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+main, .container, .content { max-width: 1120px; margin: 0 auto; padding: 2rem clamp(1rem, 4vw, 2.5rem); }
+h1, h2, h3, h4, h5, h6 { line-height: 1.25; font-weight: 700; color: var(--fg); margin: 1.6em 0 .6em; letter-spacing: -.01em; }
+h1 { font-size: clamp(1.8rem, 1.2rem + 2vw, 2.6rem); margin-top: 0; }
+h2 { font-size: clamp(1.4rem, 1.1rem + 1vw, 1.8rem); padding-bottom: .35em; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.2rem; }
+p { margin: 0 0 1.1em; }
+a { color: var(--accent); text-decoration: none; text-underline-offset: 3px; transition: color .15s ease; }
+a:hover { color: var(--accent-strong); text-decoration: underline; }
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px;
+}
+ul, ol { padding-left: 1.5em; margin: 0 0 1.2em; }
+li { margin: .35em 0; }
+img { max-width: 100%; height: auto; display: block; border-radius: var(--radius); }
+figure { margin: 1.5em 0; }
+figcaption { font-size: .875rem; color: var(--fg-muted); text-align: center; margin-top: .5em; }
+blockquote {
+  margin: 1.5em 0; padding: .9em 1.25em; border-left: 4px solid var(--accent);
+  background: var(--accent-soft); border-radius: 0 var(--radius) var(--radius) 0; color: var(--fg);
+}
+hr { border: 0; border-top: 1px solid var(--border); margin: 2.5em 0; }
+code, kbd, samp { font-family: var(--mono); font-size: .88em; background: var(--bg-muted); padding: .15em .4em; border-radius: 6px; }
+pre { font-family: var(--mono); background: #0f172a; color: #e2e8f0; padding: 1.1em 1.3em; border-radius: var(--radius); overflow-x: auto; line-height: 1.55; }
+pre code { background: none; padding: 0; color: inherit; }
+table { width: 100%; border-collapse: collapse; margin: 1.5em 0; font-size: .95rem; }
+th, td { text-align: left; padding: .7em .9em; border-bottom: 1px solid var(--border); }
+th { background: var(--bg-soft); font-weight: 600; }
+tr:hover td { background: var(--bg-soft); }
+button, .btn, input[type="submit"] {
+  display: inline-block; font-family: var(--font); font-size: .95rem; font-weight: 600;
+  color: #fff; background: var(--accent); border: 1px solid var(--accent);
+  padding: .55em 1.15em; border-radius: var(--radius-sm); cursor: pointer;
+  transition: background .15s ease, transform .15s ease, box-shadow .15s ease;
+}
+button:hover, .btn:hover, input[type="submit"]:hover { background: var(--accent-strong); box-shadow: var(--shadow); }
+button:active, .btn:active, input[type="submit"]:active { transform: translateY(1px); }
+input, select, textarea {
+  font-family: var(--font); font-size: .95rem; color: var(--fg);
+  padding: .55em .8em; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg); transition: border-color .15s ease, box-shadow .15s ease;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
+header { background: var(--bg); border-bottom: 1px solid var(--border); }
+footer { background: var(--bg-soft); border-top: 1px solid var(--border); padding: 2rem clamp(1rem, 4vw, 2.5rem); color: var(--fg-muted); }
+.card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 1.25rem; box-shadow: var(--shadow-sm); transition: box-shadow .2s ease, transform .2s ease;
+}
+.card:hover { box-shadow: var(--shadow); transform: translateY(-2px); }
+.grid { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --bg-soft: #17191f; --bg-muted: #1f232b;
+    --fg: #e5e7eb; --fg-muted: #9ca3af; --accent: #818cf8; --accent-strong: #a5b4fc;
+    --accent-soft: #1e1b4b; --border: #262a33;
+  }
+  pre { background: #0b0f19; color: #cbd5e1; }
+}
+"""
+
+
 def _ensure_lang(soup: BeautifulSoup) -> None:
     html_tag = soup.find("html")
     if html_tag is not None and not html_tag.has_attr("lang"):
@@ -256,6 +361,14 @@ def _ensure_viewport(soup: BeautifulSoup) -> None:
     meta["name"] = "viewport"
     meta["content"] = "width=device-width, initial-scale=1.0"
     _ensure_head(soup).append(meta)
+
+
+def _ensure_style(soup: BeautifulSoup) -> None:
+    """Inject DEFAULT_STYLESHEET only when the page has no <style> of its own."""
+    if soup.find("style") is None:
+        style = soup.new_tag("style")
+        style.string = DEFAULT_STYLESHEET
+        _ensure_head(soup).append(style)
 
 
 def _ensure_heading_hierarchy(soup: BeautifulSoup) -> None:
@@ -281,11 +394,12 @@ def _remove_flash(soup: BeautifulSoup) -> None:
 
 
 def _ensure_basics_into(soup: BeautifulSoup) -> None:
-    """Apply the structural (content-free) fixes: lang / viewport / heading hierarchy / remove Flash."""
+    """Apply the structural (content-free) fixes: lang / viewport / heading hierarchy / remove Flash / style."""
     _ensure_lang(soup)
     _ensure_viewport(soup)
     _ensure_heading_hierarchy(soup)
     _remove_flash(soup)
+    _ensure_style(soup)
 
 
 def ensure_basics(html: str) -> str:

@@ -155,3 +155,17 @@ def test_merge_head_preserves_conditional_comment_script():
     out = _merge_head(source, "<head><title>New</title></head>")
     assert "//misc.js" in out
     assert "<title>New</title>" in out
+
+
+def test_finalize_injects_default_style_when_unstyled():
+    html = '<html><head><title>Hi</title></head><body><h1>Hello</h1><p>x</p></body></html>'
+    out = finalize(html)
+    assert "prefers-color-scheme" in out
+    assert "--accent-strong: #4338ca" in out
+
+
+def test_finalize_keeps_existing_style():
+    html = '<html><head><title>Hi</title><style>body{color:red}</style></head><body><h1>x</h1></body></html>'
+    out = finalize(html)
+    assert "color:red" in out
+    assert "--accent-strong: #4338ca" not in out
