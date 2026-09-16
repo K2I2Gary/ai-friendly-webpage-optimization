@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-a14y + DeepSeek 网页 AI 可读性评估工作流
-用法: python ai_eval.py <目标URL> [--mode page|site]
+a14y + LLM web AI-readability evaluation workflow
+Usage: python ai_eval.py <target URL> [--mode page|site]
 """
 
 import subprocess
@@ -14,17 +14,17 @@ from datetime import datetime
 
 from llm import chat, get_config
 
-# Windows 控制台默认 GBK，强制 stdout/stderr 用 UTF-8，避免中文打印乱码
+# Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
-# ============ 配置 ============
+# ============ Config ============
 OUTPUT_FILE = "eval.txt"
 
-# 分数 → 等级映射
+# Score -> grade mapping
 GRADE_BANDS = [
     (90, "A"),
     (80, "B"),
@@ -40,23 +40,23 @@ def score_to_grade(score: int) -> str:
     return "F"
 
 
-# ============ Step 1: 调用 a14y CLI ============
+# ============ Step 1: call the a14y CLI ============
 
 def run_a14y(url: str, mode: str = "page") -> dict:
-    """调用 a14y CLI 对目标 URL 评估，返回解析后的 JSON。"""
+    """Run the a14y CLI against the target URL and return the parsed JSON."""
     a14y_bin = shutil.which("a14y")
     if not a14y_bin:
         raise RuntimeError(
-            "找不到 a14y，请确认已运行 `npm install -g a14y`，"
-            "并且 npm 全局 bin 目录已加入 PATH。"
+            "a14y not found. Run `npm install -g a14y` and make sure the npm global "
+            "bin directory is on PATH."
         )
-    print(f"[a14y] 可执行文件: {a14y_bin}")
+    print(f"[a14y] executable: {a14y_bin}")
 
     cmd = [a14y_bin, "check", url, "-o", "json", "-m", mode]
     if mode == "site":
         cmd += ["--max-pages", "50"]
 
-    print(f"[a14y] 正在评估: {url} (mode={mode})")
+    print(f"[a14y] evaluating: {url} (mode={mode})")
 
     result = subprocess.run(
         cmd,
@@ -70,23 +70,23 @@ def run_a14y(url: str, mode: str = "page") -> dict:
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"a14y 评估失败 (exit={result.returncode}):\n"
+            f"a14y evaluation failed (exit={result.returncode}):\n"
             f"STDOUT:\n{result.stdout}\n"
             f"STDERR:\n{result.stderr}"
         )
 
-    # a14y 有时会在 stdout 前面混入 npm 警告，从第一个 { 开始截取
+    # a14y sometimes prepends npm warnings to stdout; cut from the first '{' onward
     stdout = result.stdout
     brace = stdout.find("{")
     if brace > 0:
         stdout = stdout[brace:]
 
     data = json.loads(stdout)
-    print(f"[a14y] 总分: {data['summary']['score']}/100")
+    print(f"[a14y] total score: {data['summary']['score']}/100")
     return data
 
 
-# ============ Step 2: 构造 Prompt 并调用 DeepSeek ============
+# ============ Step 2: build the prompt and call the LLM ============
 
 SYSTEM_PROMPT = """You are a senior AI-readability (Agent Readability) analyst.
 You are familiar with the a14y scorecard system, including three core dimensions:
@@ -113,7 +113,7 @@ The report must include the following sections:
 Respond in English. Be concise and avoid generic statements."""
 
 def build_user_prompt(scorecard: dict) -> str:
-    """将 a14y JSON 评分卡格式化为 DeepSeek 可读的文本"""
+    """Format the a14y JSON scorecard into text the LLM can read"""
     summary = scorecard.get("summary", {})
     lines = [
         f"Target URL: {scorecard.get('url', 'N/A')}",
@@ -151,11 +151,11 @@ def build_user_prompt(scorecard: dict) -> str:
     return "\n".join(lines)
 
 
-def analyze_with_deepseek(scorecard: dict) -> str:
+def analyze_with_llm(scorecard: dict) -> str:
     cfg = get_config("eval")
     user_content = build_user_prompt(scorecard)
 
-    print(f"[LLM] 正在请求深度分析 (provider={cfg.provider}, model={cfg.model})...")
+    print(f"[LLM] requesting deep analysis (provider={cfg.provider}, model={cfg.model})...")
     return chat(
         [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -166,7 +166,7 @@ def analyze_with_deepseek(scorecard: dict) -> str:
     )
 
 
-# ============ Step 3: 写入 eval.txt ============
+# ============ Step 3: write eval.txt ============
 
 def write_eval_file(url: str, scorecard: dict, analysis: str):
     summary = scorecard.get("summary", {})
@@ -176,45 +176,45 @@ def write_eval_file(url: str, scorecard: dict, analysis: str):
 
     content = f"""
 {'=' * 60}
-  a14y AI 可读性评估报告
+  a14y AI-readability evaluation report
 {'=' * 60}
-评估时间: {now}
-目标 URL: {url}
-模式: {scorecard.get('mode', 'N/A')}
-评分卡版本: {scorecard.get('scorecardVersion', 'N/A')}
-总分: {score}/100  (等级: {grade})
-统计: pass={summary.get('passed')} / fail={summary.get('failed')} /
+Evaluated at: {now}
+Target URL: {url}
+Mode: {scorecard.get('mode', 'N/A')}
+Scorecard version: {scorecard.get('scorecardVersion', 'N/A')}
+Total score: {score}/100  (grade: {grade})
+Stats: pass={summary.get('passed')} / fail={summary.get('failed')} /
       warn={summary.get('warned')} / na={summary.get('na')} /
       applicable={summary.get('applicable')}
 
 {'-' * 60}
-  DeepSeek 深度分析
+  DeepSeek analysis
 {'-' * 60}
 
 {analysis}
 
 {'=' * 60}
-  原始评分卡数据 (JSON)
+  Raw scorecard data (JSON)
 {'=' * 60}
 {json.dumps(scorecard, indent=2, ensure_ascii=False)}
 """
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"[输出] 报告已写入 {OUTPUT_FILE}")
+    print(f"[output] report written to {OUTPUT_FILE}")
 
 
-# ============ 主流程 ============
+# ============ Main ============
 
 def main():
-    parser = argparse.ArgumentParser(description="a14y + DeepSeek 网页 AI 可读性评估")
-    parser.add_argument("url", help="要评估的网页 URL")
+    parser = argparse.ArgumentParser(description="a14y + LLM web AI-readability evaluation")
+    parser.add_argument("url", help="the web page URL to evaluate")
     parser.add_argument("--mode", choices=["page", "site"], default="page",
-                        help="评估模式: page(单页) 或 site(整站)")
+                        help="evaluation mode: page (single page) or site (whole site)")
     args = parser.parse_args()
 
     scorecard = run_a14y(args.url, args.mode)
-    analysis = analyze_with_deepseek(scorecard)
+    analysis = analyze_with_llm(scorecard)
     write_eval_file(args.url, scorecard, analysis)
 
 

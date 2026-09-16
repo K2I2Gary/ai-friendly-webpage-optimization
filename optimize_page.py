@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-网页优化落地器 (Optimize Agent)
---------------------------------
-读取源 HTML 页面（本地文件或 http(s) URL，URL 优先用 Playwright 渲染 JS 抓取），
-调用 LLM 生成新的 <head> 元数据，再合并回原文，输出「AI 可读、语义化」的优化页面。
+Page optimization agent
+-----------------------
+Reads the source HTML (a local file or an http(s) URL — URLs are fetched via Playwright first to
+render JS, falling back to urllib). The LLM generates new <head> metadata plus a style block and
+image alt text; the program merges them back into the original page and writes an "AI-readable,
+semantic" optimized page.
 
-源可以是本地 HTML 文件，也可以是 http(s) URL（自动抓取 HTML）。
+The source may be a local HTML file or an http(s) URL (auto-fetched).
 
-原则：
-  - body 原样保留，URL 指向（图片 src、链接 href、iframe src 等）零丢失。
-  - LLM 只重写 <head>（title / description / og / JSON-LD / viewport）；
-    lang / h1 / 移除 Flash 等结构性修复由规则引擎兜底。
+Principles:
+  - The body is kept verbatim, so URL references (img src, link href, iframe src, ...) are never lost.
+  - The LLM only rewrites the <head> (title / description / og / JSON-LD / viewport / lang);
+    structural fixes such as lang / h1 / removing Flash are handled by the rule engine.
 
-用法:
-    python optimize_page.py test.html             # 本地文件 -> test_optimized.html
-    python optimize_page.py https://example.com   # URL（自动抓取）-> *_optimized.html
+Usage:
+    python optimize_page.py test.html             # local file -> test_optimized.html
+    python optimize_page.py https://example.com   # URL (auto-fetched) -> *_optimized.html
     python optimize_page.py test.html -o out.html
 """
 
@@ -28,7 +30,7 @@ from pathlib import Path
 
 from llm import chat, get_config
 
-# Windows 控制台默认 GBK，强制 stdout/stderr 用 UTF-8
+# Windows console defaults to GBK; force stdout/stderr to UTF-8
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
@@ -52,7 +54,7 @@ Rules:
 - Reuse the page's existing <title> text verbatim when present; never invent a different title.
 - Derive every description/og/JSON-LD value from the page content; never fabricate names, prices,
   or descriptions, and never copy the example copy in the instruction.
-- If an 'a14y 评估发现的问题' section is present, treat its failing items as the priority list to fix.
+- If an 'a14y findings' section is present, treat its failing items as the priority list to fix.
 - For og:url and JSON-LD url, use the given page URL when provided; otherwise omit them.
 
 After the </head>, output a line "LANG:" followed by the page's language code (BCP 47, e.g. "en",
@@ -75,7 +77,7 @@ Include at most 15 images; if none need alt, output ALTS: []. Do not add anythin
 
 
 def _build_head_prompt(source: str, url: str | None, prompt: str = "") -> str:
-    """构造给 LLM 的精简上下文：原文 <head> + 正文摘要 + 页面 URL + a14y 发现的问题。"""
+    """Build a compact context for the LLM: original <head> + body text summary + page URL + a14y findings."""
     head = ""
     m = re.search(r"<head[^>]*>(.*?)</head>", source, flags=re.I | re.S)
     if m:
@@ -86,25 +88,25 @@ def _build_head_prompt(source: str, url: str | None, prompt: str = "") -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()[:2500]
 
-    lines = ["请为下面的网页生成新的 <head> 元数据。"]
+    lines = ["Generate new <head> metadata for the page below."]
     if url:
-        lines.append(f"页面 URL: {url}")
-    lines += ["", "=== 原文 <head> ===", head or "（无）", "",
-              "=== 正文摘要（去脚本/样式后） ===", text or "（无正文）"]
+        lines.append(f"Page URL: {url}")
+    lines += ["", "=== Original <head> ===", head or "(none)", "",
+              "=== Body text summary (scripts/styles stripped) ===", text or "(no body text)"]
 
     if prompt:
-        # 精简 reflect 的分析：去代码块、压缩空行、截断
+        # Condense the reflect analysis: strip code blocks, collapse blank lines, truncate
         p = re.sub(r"```.*?```", "", prompt, flags=re.S)
         p = re.sub(r"\n{2,}", "\n", p).strip()[:2000]
         if p:
-            lines += ["", "=== a14y 评估发现的问题（优先修复这些） ===", p]
+            lines += ["", "=== a14y findings (fix these first) ===", p]
     return "\n".join(lines)
 
 
 def _merge_head(source: str, new_head: str) -> str:
-    """把 LLM 生成的 <head> 合并进源页面，同时保留源 head 里的资源标签
-    （link / script / style / base），避免丢失样式表、脚本、图标等 URL；
-    源有 charset 而新 head 没有时也补上，防止编码错乱。"""
+    """Merge the LLM's <head> into the source page while preserving the source head's resource tags
+    (link / script / style / base) so stylesheet / script / icon URLs are not lost. Also carry over
+    the charset when the source has one and the new head does not, to avoid encoding issues."""
     sm = re.search(r"<head[^>]*>(.*?)</head>", source, flags=re.I | re.S)
     if not sm:
         return re.sub(r"(<html[^>]*>)", lambda mm: mm.group(1) + new_head, source,
@@ -115,7 +117,7 @@ def _merge_head(source: str, new_head: str) -> str:
         r'<link\b[^>]*>|<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>|<base\b[^>]*>',
         old_inner, flags=re.I | re.S)
 
-    # charset：源有而新 head 没有，则补上
+    # charset: add it if the source has one and the new head does not
     if not re.search(r"<meta\b[^>]*\bcharset\b", new_head, flags=re.I):
         cm = re.search(r"<meta\b[^>]*\bcharset\b[^>]*>", old_inner, flags=re.I)
         if cm:
@@ -123,7 +125,8 @@ def _merge_head(source: str, new_head: str) -> str:
 
     if keep:
         joined = "\n".join(keep)
-        # 用 lambda 替换：joined 里可能含反斜杠（CSS hack / JS 转义），不能走字符串替换的组引用解析
+        # Use a lambda replacement: `joined` may contain backslashes (CSS hacks / JS escapes),
+        # which must not be interpreted as group references in a string replacement.
         new_head = re.sub(r"(</head>)", lambda m: joined + "\n" + m.group(1), new_head,
                           count=1, flags=re.I)
 
@@ -132,7 +135,7 @@ def _merge_head(source: str, new_head: str) -> str:
 
 
 def _apply_lang(html: str, raw: str) -> str:
-    """从 LLM 输出里解析 LANG，设置到根 <html lang="...">；失败则保留原样。"""
+    """Parse LANG from the LLM output and set it on the root <html lang="...">; leave unchanged on failure."""
     m = re.search(r"LANG\s*:\s*([A-Za-z][A-Za-z0-9-]*)", raw)
     if not m:
         return html
@@ -148,7 +151,8 @@ def _apply_lang(html: str, raw: str) -> str:
 
 
 def _apply_style(html: str, raw: str) -> str:
-    """从 LLM 输出里提取 <style> 注入到 head 末尾（原资源之后），让新样式优先生效。"""
+    """Extract the <style> from the LLM output and inject it at the end of the head (after the original
+    resources), so the new styles take precedence."""
     m = re.search(r"STYLE\s*:\s*(<style\b[^>]*>.*?</style>)", raw, flags=re.I | re.S)
     if m:
         style = m.group(1)
@@ -165,7 +169,8 @@ def _apply_style(html: str, raw: str) -> str:
 
 
 def _apply_alts(html: str, raw: str) -> str:
-    """从 LLM 输出里解析 ALTS 数组，给缺 alt 的 <img> 注入 alt 文本。失败则原样返回。"""
+    """Parse the ALTS array from the LLM output and inject alt text into <img> tags lacking alt.
+    Return unchanged on failure."""
     m = re.search(r"ALTS\s*:\s*(\[.*?\])", raw, flags=re.S)
     if not m:
         return html
@@ -184,7 +189,7 @@ def _apply_alts(html: str, raw: str) -> str:
 
 
 def _inject_alt(html: str, src: str, alt: str) -> str:
-    """给 src 匹配、且缺少 alt 的首个 <img> 注入 alt（兼容 <img> 与 <img />）。"""
+    """Inject alt into the first <img> whose src matches and which lacks alt (handles <img> and <img />)."""
     alt = alt.replace('"', "'")
     pat = re.compile(
         r'<img\b(?![^>]*\balt\s*=)[^>]*?\bsrc\s*=\s*["\']' + re.escape(src) + r'["\'][^>]*>',
@@ -199,10 +204,10 @@ def _inject_alt(html: str, src: str, alt: str) -> str:
 
 
 def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> str | None:
-    """让 LLM 只产出新的 <head> 元数据，再合并回原文（body 原样保留 → URL 零丢失）。
-    返回合并后的完整页面；LLM 未返回有效 <head> 时返回 None（交由规则兜底）。"""
+    """Have the LLM produce only the new <head> metadata, then merge it back (body kept verbatim -> zero
+    URL loss). Returns the merged full page, or None if the LLM returned no valid <head> (rule fallback)."""
     cfg = get_config("generate")
-    print(f"[优化] 正在请求 {cfg.provider} (model={cfg.model}) ...")
+    print(f"[optimize] requesting {cfg.provider} (model={cfg.model}) ...")
     raw = chat(
         [
             {"role": "system", "content": HEAD_SYSTEM_PROMPT},
@@ -211,7 +216,7 @@ def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> 
         temperature=0.2,
         config=cfg,
     )
-    # 剥离可能的 ```html 围栏
+    # Strip any ```html fences
     raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip())
     raw = re.sub(r"\s*```$", "", raw)
     m = re.search(r"<head[^>]*>.*?</head>", raw, flags=re.I | re.S)
@@ -223,13 +228,13 @@ def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> 
     return _apply_alts(merged, raw)
 
 
-# ============ 规则兜底：确定性最小修复 ============
-# ensure_basics：只补「纯结构」项（lang / viewport / h1 / 移除 Flash），不新增任何内容。
-# optimize_with_rules：在 ensure_basics 基础上再补 meta description / JSON-LD（无 LLM 时的兜底）。
+# ============ Rule fallback: deterministic minimal fixes ============
+# ensure_basics: only fill "structural" items (lang / viewport / h1 / remove Flash), never adding content.
+# optimize_with_rules: on top of ensure_basics, also add meta description / JSON-LD (no-LLM fallback).
 
 def ensure_basics(html: str) -> str:
     # 1) lang
-    html = re.sub(r"<html(?![^>]*\blang=)", '<html lang="zh-CN"', html, count=1)
+    html = re.sub(r"<html(?![^>]*\blang=)", '<html lang="en"', html, count=1)
 
     # 2) viewport
     if 'name="viewport"' not in html and "name='viewport'" not in html:
@@ -237,7 +242,7 @@ def ensure_basics(html: str) -> str:
                       'content="width=device-width, initial-scale=1.0">',
                       html, count=1)
 
-    # 3) 标题层级：首个 h2-h6 提级为 h1；不足 2 个 h2 时把 h3 提级为 h2
+    # 3) heading hierarchy: promote the first h2-h6 to h1; promote h3 to h2 while fewer than 2 h2s
     if "<h1" not in html:
         html = re.sub(r"<h([2-6])([^>]*)>(.*?)</h\1>", r"<h1\2>\3</h1>", html,
                       count=1, flags=re.S)
@@ -248,15 +253,15 @@ def ensure_basics(html: str) -> str:
             break
         html = new
 
-    # 4) 移除 Flash object
+    # 4) remove Flash objects
     html = re.sub(r"<object[^>]*type=[\"']application/x-shockwave-flash[\"'][^>]*>.*?</object>",
-                  "<!-- 已移除 Flash 占位 -->", html, flags=re.S)
+                  "<!-- Removed Flash placeholder -->", html, flags=re.S)
 
     return html
 
 
 def _page_title(html: str) -> str:
-    """从 <title> 或首个 <h1> 提取页面标题（用于兜底的 description / JSON-LD）。"""
+    """Extract the page title from <title> or the first <h1> (used for fallback description / JSON-LD)."""
     for pat in (r"<title[^>]*>(.*?)</title>", r"<h1[^>]*>(.*?)</h1>"):
         m = re.search(pat, html, flags=re.I | re.S)
         if m:
@@ -264,11 +269,11 @@ def _page_title(html: str) -> str:
             t = re.sub(r"\s+", " ", t).replace('"', "'").strip()
             if t:
                 return t
-    return "网页页面"
+    return "Web page"
 
 
 def ensure_head_meta(html: str, title: str) -> str:
-    """补齐 meta description 与 WebSite JSON-LD（缺失时用 title 派生通用内容）。"""
+    """Fill in meta description and WebSite JSON-LD (derived from title when missing)."""
     if 'name="description"' not in html and "name='description'" not in html:
         meta = '<meta name="description" content="' + title + '">'
         html = re.sub(r"(</head>)", lambda m: meta + "\n" + m.group(1),
@@ -283,7 +288,7 @@ def ensure_head_meta(html: str, title: str) -> str:
 
 
 def ensure_h1(html: str, title: str) -> str:
-    """页面无任何标题时，用 title 补一个 <h1>。"""
+    """Add an <h1> derived from the title when the page has no headings at all."""
     if "<h1" not in html:
         html = re.sub(r"(<body[^>]*>)", lambda m: m.group(1) + "<h1>" + title + "</h1>",
                       html, count=1, flags=re.I)
@@ -291,7 +296,7 @@ def ensure_h1(html: str, title: str) -> str:
 
 
 def finalize(html: str) -> str:
-    """统一兜底：纯结构项 + 通用 meta + 兜底 h1。LLM 产出后也用它做安全网。"""
+    """Unified fallback: structural items + generic meta + fallback h1. Also used as a safety net after LLM output."""
     html = ensure_basics(html)
     title = _page_title(html)
     html = ensure_head_meta(html, title)
@@ -299,27 +304,27 @@ def finalize(html: str) -> str:
 
 
 def optimize_with_rules(source: str) -> str:
-    """无 LLM 时的完整兜底（等价于 finalize(source)）。"""
+    """Full no-LLM fallback (equivalent to finalize(source))."""
     return finalize(source)
 
 
-# ============ URL 约束：保留原始集合 + 去除虚构资源 ============
+# ============ URL constraints: keep the original set + strip fictional resources ============
 
 def extract_urls(html: str) -> set:
-    """提取 html 中所有 href / src / action 指向的 URL。"""
+    """Extract all URLs referenced by href / src / action."""
     return set(re.findall(r'(?:href|src|action)\s*=\s*["\']([^"\']+)["\']', html))
 
 
 def strip_fictional_resources(source: str, html: str) -> str:
-    """删除输出中源页面不存在的静态资源引用（样式表 / 外部脚本），避免虚构资源。"""
+    """Remove static-resource references not present in the source (stylesheets / external scripts)."""
     src_urls = extract_urls(source)
-    # 样式表：源里没有对应 URL 的 <link rel="stylesheet"> 直接移除
+    # stylesheets: drop <link rel="stylesheet"> whose URL is not in the source
     html = re.sub(
         r'<link\b[^>]*rel=["\']stylesheet["\'][^>]*>',
         lambda m: m.group(0) if (extract_urls(m.group(0)) & src_urls) else "",
         html, flags=re.I,
     )
-    # 外部脚本：源里没有对应 URL 的 <script src="..."></script> 直接移除
+    # external scripts: drop <script src="..."></script> whose URL is not in the source
     html = re.sub(
         r'<script\b[^>]*\bsrc\s*=[^>]*>\s*</script>',
         lambda m: m.group(0) if (extract_urls(m.group(0)) & src_urls) else "",
@@ -329,22 +334,22 @@ def strip_fictional_resources(source: str, html: str) -> str:
 
 
 def strip_fabricated_content(source: str, html: str) -> str:
-    """移除输出中源页面不存在的「内容元素」：
-    1. 伪造的 <a> 链接（href 不在源 URL 集合里）
-    2. 源里没有的整块 <nav> / <footer>
+    """Remove "content elements" that do not exist in the source:
+    1. fabricated <a> links (href not in the source URL set)
+    2. whole <nav> / <footer> blocks not present in the source
     """
     src_urls = extract_urls(source)
 
-    # 1) 移除伪造链接（整个 <a>...</a>）
+    # 1) remove fabricated links (whole <a>...</a>)
     def keep_a(m):
         tag = m.group(0)
         hrefs = extract_urls(tag)
-        if not hrefs:  # 无 href 的 <a>（如 <a name=...>）保留
+        if not hrefs:  # keep <a> without href (e.g. <a name=...>)
             return tag
         return tag if all(h in src_urls for h in hrefs) else ""
     html = re.sub(r'<a\b[^>]*>.*?</a>', keep_a, html, flags=re.I | re.S)
 
-    # 2) 源里没有的整块 nav / footer 删除
+    # 2) remove whole nav / footer blocks not present in the source
     if "<nav" not in source.lower():
         html = re.sub(r'<nav\b[^>]*>.*?</nav>', "", html, flags=re.I | re.S)
     if "<footer" not in source.lower():
@@ -353,57 +358,57 @@ def strip_fabricated_content(source: str, html: str) -> str:
     return html
 
 
-# ============ 自检 ============
+# ============ Self-check ============
 
 CHECKS = [
     ('viewport', 'name="viewport"'),
     ('meta description', 'name="description"'),
     ('JSON-LD', 'application/ld+json'),
-    ('h1 标题', '<h1'),
-    ('移除 Flash', 'x-shockwave-flash'),
+    ('h1 heading', '<h1'),
+    ('remove Flash', 'x-shockwave-flash'),
 ]
 
 
 def self_check(source: str, html: str) -> int:
     failed = 0
-    print("[自检] 优化后页面关键项：")
-    # lang：根 <html> 需有 lang 属性（值不限，跟随页面实际语言）
+    print("[self-check] key items of the optimized page:")
+    # lang: the root <html> must have a lang attribute (any value, following the page's actual language)
     lang_ok = bool(re.search(r"<html[^>]*\blang\s*=\s*[\"']", html, flags=re.I))
-    print(f"  {'✅' if lang_ok else '❌'} lang 属性")
+    print(f"  {'✅' if lang_ok else '❌'} lang attribute")
     if not lang_ok:
         failed += 1
     for name, needle in CHECKS:
-        # Flash 项是“应不存在”
-        ok = (needle not in html) if name == '移除 Flash' else (needle in html)
+        # the Flash item should be ABSENT
+        ok = (needle not in html) if name == 'remove Flash' else (needle in html)
         print(f"  {'✅' if ok else '❌'} {name}")
         if not ok:
             failed += 1
 
-    # 原始 URL 集合保留校验
+    # original URL set preserved
     src_urls = extract_urls(source)
     out_urls = extract_urls(html)
     missing = sorted(u for u in src_urls if u not in out_urls)
-    print(f"  {'✅' if not missing else '❌'} 原始 URL 全部保留（{len(src_urls)} 个）")
+    print(f"  {'✅' if not missing else '❌'} all original URLs preserved ({len(src_urls)} total)")
     for u in missing:
-        print(f"     丢失: {u}")
+        print(f"     missing: {u}")
     if missing:
         failed += 1
 
-    # 虚构资源校验（新增 .css/.js 引用）
+    # fictional resources (new .css/.js references)
     fictional = sorted(u for u in out_urls - src_urls
                        if u.lower().endswith((".css", ".js")))
-    print(f"  {'✅' if not fictional else '❌'} 无新增虚构资源（css/js）")
+    print(f"  {'✅' if not fictional else '❌'} no new fabricated resources (css/js)")
     for u in fictional:
-        print(f"     新增: {u}")
+        print(f"     added: {u}")
     if fictional:
         failed += 1
 
-    # 新增链接校验（<a> 的 href 都应来自源页面）
+    # new links (every <a> href must come from the source)
     a_hrefs = set(re.findall(r'<a\b[^>]*href=["\']([^"\']+)["\']', html))
     new_links = sorted(h for h in a_hrefs if h not in src_urls)
-    print(f"  {'✅' if not new_links else '❌'} 无新增链接（<a>）")
+    print(f"  {'✅' if not new_links else '❌'} no new links (<a>)")
     for h in new_links:
-        print(f"     新增: {h}")
+        print(f"     added: {h}")
     if new_links:
         failed += 1
 
@@ -415,16 +420,16 @@ def is_url(s: str) -> bool:
 
 
 def fetch_url(url: str) -> str:
-    """抓取 URL 的 HTML：优先 Playwright 渲染 JS，未安装/失败则回退 urllib。"""
+    """Fetch a URL's HTML: prefer Playwright to render JS, fall back to urllib when unavailable/failed."""
     html = _fetch_playwright(url)
     if html is not None:
         return html
-    print("[信息] Playwright 不可用或失败，回退 urllib 抓取 ...", file=sys.stderr)
+    print("[info] Playwright unavailable or failed, falling back to urllib ...", file=sys.stderr)
     return _fetch_urllib(url)
 
 
 def _fetch_playwright(url: str) -> str | None:
-    """用无头浏览器渲染 JS 并返回最终 HTML；不可用/失败返回 None。"""
+    """Render JS with a headless browser and return the final HTML; None if unavailable/failed."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -438,7 +443,7 @@ def _fetch_playwright(url: str) -> str | None:
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/120.0 Safari/537.36")
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1500)  # 等待 JS 首屏渲染
+                page.wait_for_timeout(1500)  # wait for first-paint JS rendering
                 return page.content()
             finally:
                 browser.close()
@@ -447,7 +452,7 @@ def _fetch_playwright(url: str) -> str | None:
 
 
 def _fetch_urllib(url: str) -> str:
-    """urllib 兜底抓取（按响应头解码，失败则 utf-8 替换）。"""
+    """urllib fallback (decode per the response header; utf-8 replace on failure)."""
     req = urllib.request.Request(
         url, headers={"User-Agent": "Mozilla/5.0 (AgenticPage Optimizer)",
                       "Accept-Encoding": "identity"})
@@ -458,7 +463,7 @@ def _fetch_urllib(url: str) -> str:
 
 
 def url_to_filename(url: str) -> str:
-    """把 URL 转成安全的本地文件名（不含扩展名）。"""
+    """Convert a URL into a safe local filename (without extension)."""
     u = url.split("#", 1)[0].split("?", 1)[0]
     u = re.sub(r"^https?://", "", u)
     u = re.sub(r"[^A-Za-z0-9._-]+", "_", u).strip("_")
@@ -466,25 +471,25 @@ def url_to_filename(url: str) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="读取源 HTML + prompt 生成优化页面")
+    parser = argparse.ArgumentParser(description="Read source HTML + prompt and generate an optimized page")
     parser.add_argument("source", nargs="?", default=str(BASE_DIR / "test.html"),
-                        help="源 HTML 路径（默认 ./test.html）")
+                        help="source HTML path (default ./test.html)")
     parser.add_argument("-p", "--prompt", default=str(DEFAULT_PROMPT),
-                        help="优化指令路径（默认 ./prompt.txt）")
-    parser.add_argument("-o", "--output", help="输出 HTML 路径（默认 <source>_optimized.html）")
-    parser.add_argument("--no-llm", action="store_true", help="强制规则引擎")
-    parser.add_argument("--debug", action="store_true", help="失败时打印堆栈")
+                        help="optimization instruction path (default ./prompt.txt)")
+    parser.add_argument("-o", "--output", help="output HTML path (default <source>_optimized.html)")
+    parser.add_argument("--no-llm", action="store_true", help="force the rule engine")
+    parser.add_argument("--debug", action="store_true", help="print traceback on failure")
     args = parser.parse_args()
 
     if is_url(args.source):
-        print(f"[信息] 抓取 URL: {args.source}")
+        print(f"[info] fetching URL: {args.source}")
         source = fetch_url(args.source)
         out_path = Path(args.output) if args.output else \
             BASE_DIR / (url_to_filename(args.source) + "_optimized.html")
     else:
         src_path = Path(args.source)
         if not src_path.exists():
-            print(f"[错误] 找不到源文件: {src_path}", file=sys.stderr)
+            print(f"[error] source file not found: {src_path}", file=sys.stderr)
             sys.exit(1)
         source = src_path.read_text(encoding="utf-8")
         out_path = Path(args.output) if args.output else \
@@ -493,50 +498,50 @@ def main():
     if Path(args.prompt).exists():
         prompt = Path(args.prompt).read_text(encoding="utf-8")
     else:
-        print(f"[警告] 未找到 prompt 文件: {args.prompt}，LLM 将缺少 a14y 问题参考", file=sys.stderr)
+        print(f"[warning] prompt file not found: {args.prompt}; the LLM will lack a14y findings", file=sys.stderr)
 
     target_url = args.source if is_url(args.source) else None
 
     result = None
     if not args.no_llm:
         if get_config("generate").api_key:
-            # 已配置 key：调用 LLM，失败则直接中止，不再静默降级
+            # key configured: call the LLM, abort on failure rather than silently degrading
             try:
                 result = optimize_with_llm(source, target_url, prompt)
             except Exception as e:  # noqa: BLE001
-                print(f"[错误] LLM 优化失败（已配置 API key，中止）: {e}", file=sys.stderr)
+                print(f"[error] LLM optimization failed (key configured, aborting): {e}", file=sys.stderr)
                 if args.debug:
                     import traceback
                     traceback.print_exc()
                 sys.exit(1)
 
     if not result:
-        print("[优化] 使用规则引擎生成 ...")
+        print("[optimize] using the rule engine ...")
         result = optimize_with_rules(source)
     else:
-        # LLM 只替换了 <head>；补齐结构项与兜底 meta/h1（body 原样 → URL 零丢失）
+        # the LLM only replaced <head>; fill structural items and fallback meta/h1 (body verbatim -> zero URL loss)
         result = finalize(result)
 
     result = strip_fictional_resources(source, result)
     result = strip_fabricated_content(source, result)
 
-    # 安全网：理论上 body 未动不会丢 URL；万一仍丢失则回退规则引擎（保留全部链接）。
+    # Safety net: in theory the body is untouched so no URL is lost; fall back to the rule engine otherwise.
     lost = extract_urls(source) - extract_urls(result)
     if lost:
-        print(f"[警告] 输出丢失 {len(lost)} 个原始 URL，改用规则引擎（保留全部链接）...",
+        print(f"[warning] output lost {len(lost)} original URLs, switching to the rule engine (keeps all links) ...",
               file=sys.stderr)
         result = optimize_with_rules(source)
         result = strip_fictional_resources(source, result)
         result = strip_fabricated_content(source, result)
 
     out_path.write_text(result + "\n", encoding="utf-8")
-    print(f"[输出] 优化后页面已写入 {out_path}")
+    print(f"[output] optimized page written to {out_path}")
 
     failed = self_check(source, result)
     if failed:
-        print(f"[自检] {failed} 项未通过", file=sys.stderr)
+        print(f"[self-check] {failed} item(s) failed", file=sys.stderr)
         sys.exit(1)
-    print("[自检] 全部通过 ✔")
+    print("[self-check] all passed")
 
 
 if __name__ == "__main__":

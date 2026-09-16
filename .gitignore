@@ -1,6 +1,7 @@
 # ===== 配置与密钥：绝不提交 =====
 llm_config.json          # 含 API key 的实际配置
 .env
+llm_config.json
 
 # ===== Python =====
 __pycache__/

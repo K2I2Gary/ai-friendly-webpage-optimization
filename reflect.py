@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-eval.txt 反思器 (Reflection Engine)
------------------------------------
-读取 ai_eval.py 生成的 eval.txt，对评估结果进行"反思"：
-  1. 解析出原始评分卡 JSON + DeepSeek 初步分析 + 元信息（URL / 总分 / 等级）。
-  2. 只针对 fail / warn 检查项（na 项不参与、不批评），提炼出可落地的修复动作。
-  3. 生成一份可直接执行、可验收的"网页优化指令"（prompt），写入 prompt.txt，
-     交给下一个 agent 落地修改网页。
+eval.txt reflection engine
+--------------------------
+Reads eval.txt produced by ai_eval.py and "reflects" on the results:
+  1. Parses the raw scorecard JSON + the initial LLM analysis + metadata (URL / score / grade).
+  2. Handles only fail / warn checks (na items are excluded, never criticized) and distills
+     actionable fixes.
+  3. Produces an executable, verifiable "page optimization instruction" (prompt) into prompt.txt,
+     to be applied by the next agent.
 
-优先用 DeepSeek 做反思（与 ai_eval.py 同一套 API），
-无 key / 调用失败时自动退化为规则引擎，保证 prompt.txt 一定能产出。
+Prefers the LLM for reflection (same API as ai_eval.py); falls back to the rule engine when
+there is no key or the LLM call fails, guaranteeing prompt.txt is always produced.
 
-用法:
-    python reflect.py                     # 读取 eval.txt -> 写 prompt.txt
+Usage:
+    python reflect.py                     # read eval.txt -> write prompt.txt
     python reflect.py eval.txt -o out.txt
-    python reflect.py --no-llm            # 强制使用规则引擎（离线）
+    python reflect.py --no-llm            # force the rule engine (offline)
 """
 
 import json
@@ -26,14 +27,14 @@ from pathlib import Path
 
 from llm import chat, get_config
 
-# Windows 控制台默认 GBK，强制 stdout/stderr 用 UTF-8，避免中文打印乱码
+# Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
-# ============ 路径与配置 ============
+# ============ Paths & config ============
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = BASE_DIR / "eval.txt"
 DEFAULT_OUTPUT = BASE_DIR / "prompt.txt"
@@ -41,17 +42,17 @@ DEFAULT_OUTPUT = BASE_DIR / "prompt.txt"
 STATUS_MARK = {"pass": "✅", "fail": "❌", "warn": "⚠️", "error": "💥", "na": "—"}
 
 
-# ============ Step 1: 解析 eval.txt ============
+# ============ Step 1: parse eval.txt ============
 
 def parse_eval_text(text: str):
-    """从 eval.txt 提取 (scorecard dict, analysis str)。
+    """Extract (scorecard dict, analysis str) from eval.txt.
 
-    返回 None 表示解析失败。
+    Returns None if parsing fails.
     """
-    json_marker = "原始评分卡数据"
-    analysis_marker = "DeepSeek 深度分析"
+    json_marker = "Raw scorecard data"
+    analysis_marker = "DeepSeek analysis"
 
-    # 1) 原始评分卡 JSON：取 json_marker 之后的第一个 '{'
+    # 1) raw scorecard JSON: the first '{' after json_marker
     scorecard = {}
     idx = text.rfind(json_marker)
     if idx != -1:
@@ -60,9 +61,9 @@ def parse_eval_text(text: str):
             try:
                 scorecard = json.loads(text[brace:])
             except json.JSONDecodeError as e:
-                print(f"[警告] 评分卡 JSON 解析失败: {e}", file=sys.stderr)
+                print(f"[warning] scorecard JSON parse failed: {e}", file=sys.stderr)
 
-    # 2) DeepSeek 分析文本：analysis_marker 与 json_marker 之间
+    # 2) DeepSeek analysis text: between analysis_marker and json_marker
     analysis = ""
     a_start = text.find(analysis_marker)
     a_end = text.find(json_marker)
@@ -73,7 +74,7 @@ def parse_eval_text(text: str):
 
 
 def collect_checks(scorecard: dict):
-    """汇总 siteChecks 与 pages[].checks 为单个检查项列表。"""
+    """Merge siteChecks and pages[].checks into a single list of checks."""
     checks = list(scorecard.get("siteChecks", []))
     for page in scorecard.get("pages", []):
         checks.extend(page.get("checks", []))
@@ -81,7 +82,7 @@ def collect_checks(scorecard: dict):
 
 
 def build_digest(scorecard: dict, analysis: str) -> str:
-    """把评分卡压缩成给反思模型看的精简文本（只突出 fail/warn）。"""
+    """Compress the scorecard into a concise text for the reflection model (highlight fail/warn only)."""
     summary = scorecard.get("summary", {})
     url = scorecard.get("url") or scorecard.get("baseUrl") or "N/A"
     lines = [
@@ -101,12 +102,12 @@ def build_digest(scorecard: dict, analysis: str) -> str:
     for c in fails:
         lines.append(
             f"{STATUS_MARK.get(c.get('status'), '?')} [{c.get('group')}] "
-            f"{c.get('id')} — {c.get('name')} ｜ {c.get('message')}"
+            f"{c.get('id')} — {c.get('name')} | {c.get('message')}"
         )
     for c in warns + errors:
         lines.append(
             f"{STATUS_MARK.get(c.get('status'), '?')} [{c.get('group')}] "
-            f"{c.get('id')} — {c.get('name')} ｜ {c.get('message')}"
+            f"{c.get('id')} — {c.get('name')} | {c.get('message')}"
         )
     if not fails and not warns and not errors:
         lines.append("(no failed/warning items)")
@@ -119,7 +120,7 @@ def build_digest(scorecard: dict, analysis: str) -> str:
     return "\n".join(lines)
 
 
-# ============ Step 2: 反思系统提示词 ============
+# ============ Step 2: reflection system prompt ============
 
 REFLECT_SYSTEM_PROMPT = """You are the "Reflection Engine" for web AI-readability optimization.
 
@@ -146,11 +147,11 @@ reasoning, or pleasantries. The body must follow this fixed structure:
 
 
 def reflect_with_llm(scorecard: dict, analysis: str) -> str:
-    """用 LLM 对评估结果做反思，返回给下一 agent 的指令文本。"""
+    """Reflect on the results with the LLM, returning the instruction text for the next agent."""
     cfg = get_config("reflect")
     user_content = build_digest(scorecard, analysis)
 
-    print(f"[反思] 正在请求 {cfg.provider} (model={cfg.model}) ...")
+    print(f"[reflect] requesting {cfg.provider} (model={cfg.model}) ...")
     return chat(
         [
             {"role": "system", "content": REFLECT_SYSTEM_PROMPT},
@@ -161,7 +162,7 @@ def reflect_with_llm(scorecard: dict, analysis: str) -> str:
     )
 
 
-# ============ Step 3: 规则引擎兜底 ============
+# ============ Step 3: rule-engine fallback ============
 
 FIX_HINTS = {
     "robots-txt.allows-ai-bots": {
@@ -211,7 +212,7 @@ FIX_HINTS = {
     },
     "html.lang-attribute": {
         "action": "Add a lang attribute to the root <html> tag.",
-        "code": '<html lang="zh-CN">',
+        "code": '<html lang="en">',
     },
     "html.json-ld": {
         "action": "Inject JSON-LD structured data (WebSite) into <head> or <body>.",
@@ -243,7 +244,7 @@ FIX_HINTS = {
 
 
 def reflect_with_rules(scorecard: dict) -> str:
-    """规则引擎：根据 fail/warn 检查项确定性生成指令（离线兜底）。"""
+    """Rule engine: deterministically generate instructions from fail/warn checks (offline fallback)."""
     summary = scorecard.get("summary", {})
     url = scorecard.get("url") or scorecard.get("baseUrl") or "N/A"
     score = summary.get("score", 0)
@@ -253,7 +254,7 @@ def reflect_with_rules(scorecard: dict) -> str:
     fails = [c for c in collect_checks(scorecard) if c.get("status") == "fail"]
     warns = [c for c in collect_checks(scorecard) if c.get("status") == "warn"]
 
-    # 目标分：把全部 fail 翻绿后的估算分（flat-pool 近似：score + failed 项权重）
+    # Target score: estimated after flipping all fails green (flat-pool approx: score + failed weight)
     target = min(100, score + failed) if applicable else score
 
     lines = [
@@ -287,8 +288,8 @@ def reflect_with_rules(scorecard: dict) -> str:
     ordered = sorted(
         fails,
         key=lambda c: (
-            c.get("id") in p0_ids,  # P0 项排最前
-            c.get("id") in p2_ids,  # P2 项排最后
+            c.get("id") in p0_ids,  # P0 items first
+            c.get("id") in p2_ids,  # P2 items last
         ),
     )
     p0 = [c for c in ordered if c.get("id") in p0_ids]
@@ -319,32 +320,33 @@ def reflect_with_rules(scorecard: dict) -> str:
     return "\n".join(lines)
 
 
-# ============ 主流程 ============
+# ============ Main ============
 
 def main():
-    parser = argparse.ArgumentParser(description="反思 eval.txt 生成网页优化 prompt")
+    parser = argparse.ArgumentParser(description="Reflect on eval.txt to generate a page optimization prompt")
     parser.add_argument("input", nargs="?", default=str(DEFAULT_INPUT),
-                        help="eval.txt 路径（默认 ./eval.txt）")
+                        help="eval.txt path (default ./eval.txt)")
     parser.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT),
-                        help="输出 prompt 路径（默认 ./prompt.txt）")
+                        help="output prompt path (default ./prompt.txt)")
     parser.add_argument("--no-llm", action="store_true",
-                        help="强制使用规则引擎，不调用 LLM")
-    parser.add_argument("--debug", action="store_true", help="LLM 失败时打印完整堆栈")
+                        help="force the rule engine, skip the LLM")
+    parser.add_argument("--debug", action="store_true", help="print full traceback on LLM failure")
     args = parser.parse_args()
 
     in_path = Path(args.input)
     if not in_path.exists():
-        print(f"[错误] 找不到输入文件: {in_path}", file=sys.stderr)
+        print(f"[error] input file not found: {in_path}", file=sys.stderr)
         sys.exit(1)
 
     text = in_path.read_text(encoding="utf-8")
     scorecard, analysis = parse_eval_text(text)
     if not scorecard:
-        print("[错误] 未能从 eval.txt 解析出评分卡 JSON，请确认文件由 ai_eval.py 生成。",
-              file=sys.stderr)
+        print("[error] could not parse the scorecard JSON from eval.txt; "
+              "make sure the file was generated by ai_eval.py.", file=sys.stderr)
         sys.exit(1)
 
-    # 反思：优先 LLM；无 key 才用规则引擎，已配置 key 但调用失败则直接中止
+    # Reflect: prefer the LLM; use the rule engine only when there is no key.
+    # With a key configured, an LLM failure aborts instead of silently degrading.
     prompt_text = None
     if not args.no_llm:
         cfg = get_config("reflect")
@@ -352,18 +354,18 @@ def main():
             try:
                 prompt_text = reflect_with_llm(scorecard, analysis)
             except Exception as e:  # noqa: BLE001
-                print(f"[错误] LLM 反思失败（已配置 API key，中止）: {e}", file=sys.stderr)
+                print(f"[error] LLM reflection failed (key configured, aborting): {e}", file=sys.stderr)
                 if args.debug:
                     traceback.print_exc()
                 sys.exit(1)
 
     if not prompt_text:
-        print("[反思] 使用规则引擎生成 ...")
+        print("[reflect] using the rule engine ...")
         prompt_text = reflect_with_rules(scorecard)
 
     out_path = Path(args.output)
     out_path.write_text(prompt_text + "\n", encoding="utf-8")
-    print(f"[输出] 优化 prompt 已写入 {out_path}")
+    print(f"[output] optimization prompt written to {out_path}")
 
 
 if __name__ == "__main__":
