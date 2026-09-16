@@ -1,0 +1,18 @@
+# ===== 配置与密钥：绝不提交 =====
+llm_config.json          # 含 API key 的实际配置
+.env
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== IDE =====
+.idea/
+
+# ===== 工作流中间产物 / 生成输出 =====
+eval.txt
+prompt.txt
+*_optimized.html
+agentic_page.html
