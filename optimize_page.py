@@ -133,7 +133,8 @@ def _build_head_prompt(source: str, url: str | None, prompt: str = "") -> str:
 
 def _merge_head_tag(soup: BeautifulSoup, new_head):
     """Replace the source <head> with `new_head`, preserving the source head's resource tags
-    (link / script / style / base) and charset (if the new head lacks one)."""
+    (link / script / style / base), charset, and any other URL-bearing element or comment
+    (e.g. conditional-comment scripts, tracking iframes) so no referenced URL is lost."""
     old_head = soup.find("head")
     if old_head is None:
         html_tag = soup.find("html")
@@ -147,8 +148,14 @@ def _merge_head_tag(soup: BeautifulSoup, new_head):
         charset_meta = old_head.find("meta", charset=True)
         if charset_meta is not None:
             new_head.insert(0, charset_meta)
-    for tag in list(old_head.find_all(["link", "script", "style", "base"])):
-        new_head.append(tag)
+    for tag in list(old_head.find_all(True)):
+        if tag.name in ("link", "script", "style", "base"):
+            new_head.append(tag)
+        elif any(tag.has_attr(a) for a in ("href", "src", "action")):
+            new_head.append(tag)
+    for comment in list(old_head.find_all(string=Comment)):
+        if "src=" in str(comment) or "href=" in str(comment):
+            new_head.append(comment)
     old_head.replace_with(new_head)
 
 
@@ -189,7 +196,7 @@ def _parse_alts(raw: str) -> list:
 def _inject_alt(soup: BeautifulSoup, src: str, alt: str) -> bool:
     """Set alt on the first <img> whose src matches and which lacks an alt attribute."""
     for img in soup.find_all("img"):
-        if unescape(img.get("src") or "") == unescape(src) and not img.has_attr("alt"):
+        if (img.get("src") == src or img.get("src") == unescape(src)) and not img.has_attr("alt"):
             img["alt"] = alt.replace('"', "'")
             return True
     return False
@@ -364,7 +371,7 @@ def strip_fictional_resources(source: str, html: str) -> str:
                 url = tag.get("href")
         elif tag.name == "script":
             url = tag.get("src")
-        if url and unescape(url) not in src_urls:
+        if url and url not in src_urls:
             tag.decompose()
     return str(soup)
 
@@ -380,7 +387,7 @@ def strip_fabricated_content(source: str, html: str) -> str:
     # 1) remove fabricated links (an <a> whose href is not in the source)
     for a in list(soup.find_all("a")):
         href = a.get("href")
-        if href is not None and unescape(href) not in src_urls:
+        if href and href not in src_urls:
             a.decompose()
 
     # 2) remove whole nav / footer blocks not present in the source

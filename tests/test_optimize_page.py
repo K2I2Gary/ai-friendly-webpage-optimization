@@ -129,3 +129,29 @@ def test_finalize_preserves_urls_with_ampersand():
     source = '<html><head><title>Hi</title></head><body><a href="/go?a=1&b=2">x</a></body></html>'
     out = finalize(source)
     assert _urls(source) <= _urls(out)
+
+
+def test_strip_fabricated_content_keeps_empty_href_anchor():
+    # an <a href=""> wraps content (e.g. an <img>); it must not be removed just because its
+    # href is empty (the original rule engine kept anchors without a meaningful href).
+    source = '<html><body><a href=""><img src="/x.png"></a></body></html>'
+    out = strip_fabricated_content(source, source)
+    assert "/x.png" in out
+
+
+def test_strip_fabricated_content_keeps_regpage_entity_link():
+    # "&amp;regPage" must not be double-decoded into "®Page" (which would drop the link).
+    source = '<html><body><a href="https://m.163.com/r.htm?from=a&amp;regPage=1">x</a></body></html>'
+    out = strip_fabricated_content(source, source)
+    assert "regPage" in out
+
+
+def test_merge_head_preserves_conditional_comment_script():
+    source = (
+        '<html><head><meta charset="UTF-8">'
+        '<!--[if lte IE 8]><script src="//misc.js"></script><![endif]-->'
+        '<title>Old</title></head><body>x</body></html>'
+    )
+    out = _merge_head(source, "<head><title>New</title></head>")
+    assert "//misc.js" in out
+    assert "<title>New</title>" in out
