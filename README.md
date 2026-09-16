@@ -30,6 +30,9 @@ input page / URL
 | `llm.py` | **Unified LLM API module** | reads `llm_config.json`, wraps multiple providers for all stages |
 | `llm_config.json` | **Single config source** | provider / model / base_url / api_key / per-stage overrides |
 | `llm_config.example.json` | Config template | a key-less example; copy it to `llm_config.json` |
+| `common.py` | Shared utilities | `console_utf8` / `is_url` / `url_to_filename` / `extract_urls`, used by all scripts |
+| `requirements.txt` | Python deps | `openai` + `beautifulsoup4` (+ optional `playwright`) |
+| `tests/` | pytest unit tests | cover the page-rewrite helpers (head merge / URL preservation / stripping) |
 | `.gitignore` | Ignore list | ignores `llm_config.json` / `.env` / `__pycache__` / intermediates |
 | `test.html` / `test_optimized.html` | Test input / output | — |
 | `eval.txt` / `prompt.txt` | Intermediates | stage ①/② outputs |
@@ -44,9 +47,9 @@ input page / URL
   ```bash
   npm install -g a14y
   ```
-- **Python deps** (only `openai`; the rest uses the stdlib):
+- **Python deps** (`openai` + `beautifulsoup4`; the rest uses the stdlib). Install with:
   ```bash
-  pip install openai
+  pip install -r requirements.txt   # or: pip install openai beautifulsoup4
   ```
 - **Playwright (optional, better URL fetching)**: URL mode uses it by default to render JS and fetch the real DOM; if not installed it falls back to urllib.
   ```bash
@@ -64,8 +67,8 @@ A complete path from zero to output.
 ### Step 1: install dependencies (once)
 
 ```bash
-npm install -g a14y    # CLI used by the evaluate stage (needs Node.js)
-pip install openai     # the only Python dependency
+npm install -g a14y                    # CLI used by the evaluate stage (needs Node.js)
+pip install -r requirements.txt        # openai + beautifulsoup4
 ```
 
 ### Step 2: configure model & API key (edit one file only)
@@ -200,6 +203,24 @@ All LLM calls go through `llm.py`, and **all model / provider / key config lives
 | `compression` | `false` (default) = add `Accept-Encoding: identity` to work around the old Brotli/httpx bug |
 | `stages` | optional per-stage (`eval` / `reflect` / `generate`) overrides of the fields above |
 
+### API key via environment variable
+
+Instead of putting the key in `llm_config.json`, you can leave `api_key` empty and export it:
+
+| Provider | Environment variable |
+|---|---|
+| `deepseek` | `DEEPSEEK_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `moonshot` | `MOONSHOT_API_KEY` |
+| `qwen` | `DASHSCOPE_API_KEY` |
+| `zhipu` | `ZHIPU_API_KEY` |
+| `xai` | `XAI_API_KEY` |
+| `openrouter` | `OPENROUTER_API_KEY` |
+| `siliconflow` | `SILICONFLOW_API_KEY` |
+
+A generic `LLM_API_KEY` works for any provider. Precedence: the `api_key` field in `llm_config.json` wins when set; otherwise the provider-specific variable, then `LLM_API_KEY`.
+
 Full example (this is the `llm_config.example.json` shipped with the project):
 
 ```json
@@ -258,15 +279,27 @@ Runs `a14y check <url> -o json` to get the scorecard, condenses the failed/warni
 Parses the scorecard JSON and initial analysis out of `eval.txt`, handles **only `fail`/`warn` checks** (`na` items excluded, never criticized), and uses the LLM to produce an optimization instruction with "P0/P1/P2 priorities + copy-pasteable snippets + acceptance criteria" into `prompt.txt`. With no key it degrades to the built-in rule engine (the `FIX_HINTS` dict) so `prompt.txt` is always produced; with a key configured, a failed call aborts.
 
 ### ③ Optimize — `optimize_page.py`
-Reads the source HTML (a local file, or an http(s) URL — URLs use **Playwright** to render JS and fetch the real DOM, falling back to urllib when not installed). The LLM generates new `<head>` metadata (title / meta description / og / JSON-LD / viewport / lang), consulting `prompt.txt` (the a14y findings from reflect) as the priority list, and also outputs a `<style>` stylesheet (content unchanged) plus image `alt` text; the program **merges these back into the original** — the rest of the body is untouched, so **zero original URLs are lost**. Heading hierarchy (1 `<h1>` + ≥2 `<h2>`) and removing Flash are handled by the rule engine.
+Reads the source HTML (a local file, or an http(s) URL — URLs use **Playwright** to render JS and fetch the real DOM, falling back to urllib when not installed). The LLM generates new `<head>` metadata (title / meta description / og / JSON-LD / viewport / lang), consulting `prompt.txt` (the a14y findings from reflect) as the priority list, and also outputs a `<style>` stylesheet (content unchanged) plus image `alt` text; the program **merges these back into the original**. The page is parsed and re-serialized with **BeautifulSoup**, so content and links are preserved but formatting / attribute quoting / entity encoding may be normalized (the body is no longer byte-verbatim); **zero original URLs are lost**. Heading hierarchy (1 `<h1>` + ≥2 `<h2>`) and removing Flash are handled by the rule engine.
 
 Three programmatic hard constraints run before writing, plus a self-check:
 
-- **Preserve the original URL set**: the body is untouched, so every `href/src/action/iframe src` is naturally kept;
+- **Preserve the original URL set**: the body's content/links are kept; every `href/src/action/iframe src` is preserved (compared after HTML-entity decoding);
 - **No fictional resources**: strip `.css/.js` references not present in the source;
 - **No fabricated content**: strip `<a>` links not in the source, and whole `<nav>`/`<footer>` blocks not in the source.
 
 The self-check (key items + URL preservation + no fictional resources + no new links) exits `1` if it fails.
+
+---
+
+## Tests
+
+The core page-rewrite helpers (head merge, URL preservation, fabricated-content stripping, alt
+injection, JSON-LD validation, pipeline parsing) have pytest unit tests:
+
+```bash
+pip install pytest
+pytest tests/
+```
 
 ---
 
@@ -279,3 +312,5 @@ The self-check (key items + URL preservation + no fictional resources + no new l
 5. **No key / failure behavior**: `eval` errors out with no key; `reflect` / `optimize` degrade to the rule engine (basic fixes) with no key, still producing `prompt.txt` / the optimized page. **Once `api_key` is set in `llm_config.json`, a failed LLM call (unreachable / auth failure, etc.) aborts the pipeline** instead of silently degrading.
 6. **Style injection is less effective on heavily-customized CSS sites**: the injected `<style>` design system clearly improves lightly-styled or unstyled pages; on sites that heavily use inline styles / `!important` (e.g. the Baidu homepage), it may be overridden or even conflict locally.
 7. **Before/after a14y comparison must exclude site-level checks**: this tool only optimizes a single page (page-level) and does not produce `robots.txt` / `llms.txt` / `sitemap` (site-level). Re-scoring the optimized local file always fails those site-level checks and drags the total down; compare page-level checks only.
+8. **Pages with no title and no headings are not padded**: the optimizer refuses to invent a title / description / `<h1>`. For such a page the rule fallback only adds `lang` + `viewport`, and the self-check then fails (`meta description` / `JSON-LD` / `h1 heading`), exiting `1` rather than writing fabricated content. Supply a real `<title>` or heading to get a full optimization.
+9. **The optimized page is re-serialized by BeautifulSoup** (`html.parser`): content and links are preserved, but the output is normalized — tag/attribute names are lower-cased, attribute values are double-quoted, `&` in URLs becomes `&amp;` (functionally identical), and void elements become self-closing. If you need byte-identical output, use the source file rather than the optimized one as the reference for diffing.

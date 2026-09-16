@@ -19,20 +19,16 @@ Usage:
 """
 
 import json
-import os
 import sys
 import argparse
 import traceback
 from pathlib import Path
 
+from common import console_utf8
 from llm import chat, get_config
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+console_utf8()
 
 # ============ Paths & config ============
 BASE_DIR = Path(__file__).resolve().parent
@@ -50,7 +46,7 @@ def parse_eval_text(text: str):
     Returns None if parsing fails.
     """
     json_marker = "Raw scorecard data"
-    analysis_marker = "DeepSeek analysis"
+    analysis_marker = "LLM analysis"
 
     # 1) raw scorecard JSON: the first '{' after json_marker
     scorecard = {}
@@ -63,7 +59,7 @@ def parse_eval_text(text: str):
             except json.JSONDecodeError as e:
                 print(f"[warning] scorecard JSON parse failed: {e}", file=sys.stderr)
 
-    # 2) DeepSeek analysis text: between analysis_marker and json_marker
+    # 2) LLM analysis text: between analysis_marker and json_marker
     analysis = ""
     a_start = text.find(analysis_marker)
     a_end = text.find(json_marker)
@@ -250,12 +246,18 @@ def reflect_with_rules(scorecard: dict) -> str:
     score = summary.get("score", 0)
     applicable = summary.get("applicable", 0)
     failed = summary.get("failed", 0)
+    passed = summary.get("passed", 0)
 
     fails = [c for c in collect_checks(scorecard) if c.get("status") == "fail"]
     warns = [c for c in collect_checks(scorecard) if c.get("status") == "warn"]
 
-    # Target score: estimated after flipping all fails green (flat-pool approx: score + failed weight)
-    target = min(100, score + failed) if applicable else score
+    # Flat-pool scoring (a14y flat-pool-v1): score ≈ passed / applicable * 100. Flipping every
+    # failed check green raises passed to passed + failed, so estimate the resulting score.
+    if applicable:
+        target = round((passed + failed) / applicable * 100)
+        target = min(100, max(score, target))
+    else:
+        target = score
 
     lines = [
         "1. Objective",

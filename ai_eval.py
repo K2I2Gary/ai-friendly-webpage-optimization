@@ -6,23 +6,21 @@ Usage: python ai_eval.py <target URL> [--mode page|site]
 
 import subprocess
 import json
-import os
 import sys
 import shutil
 import argparse
 from datetime import datetime
+from pathlib import Path
 
+from common import console_utf8
 from llm import chat, get_config
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+console_utf8()
 
 # ============ Config ============
-OUTPUT_FILE = "eval.txt"
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_FILE = BASE_DIR / "eval.txt"
 
 # Score -> grade mapping
 GRADE_BANDS = [
@@ -188,7 +186,7 @@ Stats: pass={summary.get('passed')} / fail={summary.get('failed')} /
       applicable={summary.get('applicable')}
 
 {'-' * 60}
-  DeepSeek analysis
+  LLM analysis
 {'-' * 60}
 
 {analysis}

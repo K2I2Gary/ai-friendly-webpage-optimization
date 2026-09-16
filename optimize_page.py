@@ -10,7 +10,8 @@ semantic" optimized page.
 The source may be a local HTML file or an http(s) URL (auto-fetched).
 
 Principles:
-  - The body is kept verbatim, so URL references (img src, link href, iframe src, ...) are never lost.
+  - HTML is parsed and re-serialized with BeautifulSoup, so content and links are preserved, but
+    formatting / attribute quoting / entity encoding may be normalized (the body is not byte-verbatim).
   - The LLM only rewrites the <head> (title / description / og / JSON-LD / viewport / lang);
     structural fixes such as lang / h1 / removing Flash are handled by the rule engine.
 
@@ -20,22 +21,21 @@ Usage:
     python optimize_page.py test.html -o out.html
 """
 
+import argparse
 import json
-import os
 import re
 import sys
-import argparse
 import urllib.request
+from html import unescape
 from pathlib import Path
 
+from bs4 import BeautifulSoup, Comment
+
+from common import console_utf8, extract_urls, is_url, url_to_filename
 from llm import chat, get_config
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+console_utf8()
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT = BASE_DIR / "prompt.txt"
@@ -76,17 +76,43 @@ Include at most 15 images; if none need alt, output ALTS: []. Do not add anythin
 """
 
 
+# ============ parsing helpers ============
+
+def _parse(html: str) -> BeautifulSoup:
+    """Parse HTML into a BeautifulSoup tree (html.parser, stdlib)."""
+    return BeautifulSoup(html, "html.parser")
+
+
+def _urls(html: str) -> set:
+    """Decoded URL set from a serialized HTML string (normalizes &amp; / &lt; etc.)."""
+    return {unescape(u) for u in extract_urls(html)}
+
+
+def _ensure_head(soup: BeautifulSoup):
+    """Return the <head> tag, creating one (and a root <html>) if missing."""
+    head = soup.find("head")
+    if head is not None:
+        return head
+    head = soup.new_tag("head")
+    html_tag = soup.find("html")
+    if html_tag is not None:
+        html_tag.insert(0, head)
+    else:
+        soup.insert(0, head)
+    return head
+
+
+# ============ Step: build the LLM context ============
+
 def _build_head_prompt(source: str, url: str | None, prompt: str = "") -> str:
     """Build a compact context for the LLM: original <head> + body text summary + page URL + a14y findings."""
-    head = ""
-    m = re.search(r"<head[^>]*>(.*?)</head>", source, flags=re.I | re.S)
-    if m:
-        head = m.group(0)
+    soup = _parse(source)
+    head_tag = soup.find("head")
+    head = str(head_tag) if head_tag is not None else "(none)"
 
-    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", source, flags=re.I | re.S)
-    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()[:2500]
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()[:2500]
 
     lines = ["Generate new <head> metadata for the page below."]
     if url:
@@ -103,109 +129,77 @@ def _build_head_prompt(source: str, url: str | None, prompt: str = "") -> str:
     return "\n".join(lines)
 
 
+# ============ LLM path: merge head / lang / style / alts ============
+
+def _merge_head_tag(soup: BeautifulSoup, new_head):
+    """Replace the source <head> with `new_head`, preserving the source head's resource tags
+    (link / script / style / base) and charset (if the new head lacks one)."""
+    old_head = soup.find("head")
+    if old_head is None:
+        html_tag = soup.find("html")
+        if html_tag is not None:
+            html_tag.insert(0, new_head)
+        else:
+            soup.insert(0, new_head)
+        return
+
+    if new_head.find("meta", charset=True) is None:
+        charset_meta = old_head.find("meta", charset=True)
+        if charset_meta is not None:
+            new_head.insert(0, charset_meta)
+    for tag in list(old_head.find_all(["link", "script", "style", "base"])):
+        new_head.append(tag)
+    old_head.replace_with(new_head)
+
+
 def _merge_head(source: str, new_head: str) -> str:
-    """Merge the LLM's <head> into the source page while preserving the source head's resource tags
-    (link / script / style / base) so stylesheet / script / icon URLs are not lost. Also carry over
-    the charset when the source has one and the new head does not, to avoid encoding issues."""
-    sm = re.search(r"<head[^>]*>(.*?)</head>", source, flags=re.I | re.S)
-    if not sm:
-        return re.sub(r"(<html[^>]*>)", lambda mm: mm.group(1) + new_head, source,
-                      count=1, flags=re.I)
-
-    old_inner = sm.group(1)
-    keep = re.findall(
-        r'<link\b[^>]*>|<script\b[^>]*>.*?</script>|<style\b[^>]*>.*?</style>|<base\b[^>]*>',
-        old_inner, flags=re.I | re.S)
-
-    # charset: add it if the source has one and the new head does not
-    if not re.search(r"<meta\b[^>]*\bcharset\b", new_head, flags=re.I):
-        cm = re.search(r"<meta\b[^>]*\bcharset\b[^>]*>", old_inner, flags=re.I)
-        if cm:
-            keep.insert(0, cm.group(0))
-
-    if keep:
-        joined = "\n".join(keep)
-        # Use a lambda replacement: `joined` may contain backslashes (CSS hacks / JS escapes),
-        # which must not be interpreted as group references in a string replacement.
-        new_head = re.sub(r"(</head>)", lambda m: joined + "\n" + m.group(1), new_head,
-                          count=1, flags=re.I)
-
-    return re.sub(r"<head[^>]*>.*?</head>", lambda _: new_head, source,
-                  count=1, flags=re.I | re.S)
+    """String-level wrapper of _merge_head_tag (kept for reuse / tests)."""
+    soup = _parse(source)
+    new_head_tag = _parse(new_head).find("head")
+    if new_head_tag is None:
+        return source
+    _merge_head_tag(soup, new_head_tag)
+    return str(soup)
 
 
-def _apply_lang(html: str, raw: str) -> str:
-    """Parse LANG from the LLM output and set it on the root <html lang="...">; leave unchanged on failure."""
+def _parse_lang(raw: str) -> str | None:
+    """Extract the BCP-47 language code from the LLM's `LANG:` line."""
     m = re.search(r"LANG\s*:\s*([A-Za-z][A-Za-z0-9-]*)", raw)
-    if not m:
-        return html
-    lang = m.group(1)
-
-    def set_lang(hm):
-        tag = hm.group(0)
-        if re.search(r"\blang\s*=", tag, flags=re.I):
-            return re.sub(r"\blang\s*=\s*[\"'][^\"']*[\"']",
-                          'lang="' + lang + '"', tag, count=1, flags=re.I)
-        return tag[:-1] + ' lang="' + lang + '"' + tag[-1:]
-    return re.sub(r"<html\b[^>]*>", set_lang, html, count=1, flags=re.I)
+    return m.group(1) if m else None
 
 
-def _apply_style(html: str, raw: str) -> str:
-    """Extract the <style> from the LLM output and inject it at the end of the head (after the original
-    resources), so the new styles take precedence."""
-    m = re.search(r"STYLE\s*:\s*(<style\b[^>]*>.*?</style>)", raw, flags=re.I | re.S)
-    if m:
-        style = m.group(1)
-    else:
-        styles = re.findall(r"<style\b[^>]*>.*?</style>", raw, flags=re.I | re.S)
-        style = styles[-1] if styles else ""
-    if not style:
-        return html
-    if re.search(r"</head>", html, flags=re.I):
-        return re.sub(r"(</head>)", lambda mm: style + "\n" + mm.group(1), html,
-                      count=1, flags=re.I)
-    return re.sub(r"(<body[^>]*>)", lambda mm: style + "\n" + mm.group(1), html,
-                  count=1, flags=re.I)
+def _set_lang(soup: BeautifulSoup, lang: str) -> None:
+    html_tag = soup.find("html")
+    if html_tag is not None:
+        html_tag["lang"] = lang
 
 
-def _apply_alts(html: str, raw: str) -> str:
-    """Parse the ALTS array from the LLM output and inject alt text into <img> tags lacking alt.
-    Return unchanged on failure."""
+def _parse_alts(raw: str) -> list:
+    """Parse the LLM's `ALTS:` JSON array into a list of {src, alt} dicts."""
     m = re.search(r"ALTS\s*:\s*(\[.*?\])", raw, flags=re.S)
     if not m:
-        return html
+        return []
     try:
         alts = json.loads(m.group(1))
     except (json.JSONDecodeError, TypeError):
-        return html
-    for item in (alts if isinstance(alts, list) else []):
-        if not isinstance(item, dict):
-            continue
-        src = item.get("src") or ""
-        alt = item.get("alt") or ""
-        if src and alt:
-            html = _inject_alt(html, src, alt)
-    return html
+        return []
+    return [it for it in (alts if isinstance(alts, list) else []) if isinstance(it, dict)]
 
 
-def _inject_alt(html: str, src: str, alt: str) -> str:
-    """Inject alt into the first <img> whose src matches and which lacks alt (handles <img> and <img />)."""
-    alt = alt.replace('"', "'")
-    pat = re.compile(
-        r'<img\b(?![^>]*\balt\s*=)[^>]*?\bsrc\s*=\s*["\']' + re.escape(src) + r'["\'][^>]*>',
-        flags=re.I)
-
-    def repl(m):
-        tag = m.group(0)
-        if tag.endswith('/>'):
-            return tag[:-2].rstrip() + ' alt="' + alt + '" />'
-        return tag[:-1].rstrip() + ' alt="' + alt + '">'
-    return pat.sub(repl, html)
+def _inject_alt(soup: BeautifulSoup, src: str, alt: str) -> bool:
+    """Set alt on the first <img> whose src matches and which lacks an alt attribute."""
+    for img in soup.find_all("img"):
+        if unescape(img.get("src") or "") == unescape(src) and not img.has_attr("alt"):
+            img["alt"] = alt.replace('"', "'")
+            return True
+    return False
 
 
 def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> str | None:
-    """Have the LLM produce only the new <head> metadata, then merge it back (body kept verbatim -> zero
-    URL loss). Returns the merged full page, or None if the LLM returned no valid <head> (rule fallback)."""
+    """Have the LLM produce the new <head> metadata, then merge it back (content/links preserved).
+
+    Returns the merged full page, or None if the LLM returned no valid <head> (rule fallback).
+    """
     cfg = get_config("generate")
     print(f"[optimize] requesting {cfg.provider} (model={cfg.model}) ...")
     raw = chat(
@@ -219,88 +213,134 @@ def optimize_with_llm(source: str, url: str | None = None, prompt: str = "") -> 
     # Strip any ```html fences
     raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw.strip())
     raw = re.sub(r"\s*```$", "", raw)
-    m = re.search(r"<head[^>]*>.*?</head>", raw, flags=re.I | re.S)
-    if not m:
+
+    raw_soup = _parse(raw)
+    new_head = raw_soup.find("head")
+    if new_head is None:
         return None
-    merged = _merge_head(source, m.group(0))
-    merged = _apply_lang(merged, raw)
-    merged = _apply_style(merged, raw)
-    return _apply_alts(merged, raw)
+
+    lang = _parse_lang(raw)
+    style = raw_soup.find("style")
+    alts = _parse_alts(raw)
+
+    soup = _parse(source)
+    _merge_head_tag(soup, new_head)
+    if lang:
+        _set_lang(soup, lang)
+    if style is not None:
+        _ensure_head(soup).append(style)
+    for item in alts:
+        _inject_alt(soup, item.get("src") or "", item.get("alt") or "")
+    return str(soup)
 
 
 # ============ Rule fallback: deterministic minimal fixes ============
-# ensure_basics: only fill "structural" items (lang / viewport / h1 / remove Flash), never adding content.
-# optimize_with_rules: on top of ensure_basics, also add meta description / JSON-LD (no-LLM fallback).
+
+def _ensure_lang(soup: BeautifulSoup) -> None:
+    html_tag = soup.find("html")
+    if html_tag is not None and not html_tag.has_attr("lang"):
+        html_tag["lang"] = "en"
+
+
+def _ensure_viewport(soup: BeautifulSoup) -> None:
+    if soup.find("meta", attrs={"name": "viewport"}):
+        return
+    meta = soup.new_tag("meta")
+    meta["name"] = "viewport"
+    meta["content"] = "width=device-width, initial-scale=1.0"
+    _ensure_head(soup).append(meta)
+
+
+def _ensure_heading_hierarchy(soup: BeautifulSoup) -> None:
+    # 1) promote the first h2-h6 to h1 when no h1 exists
+    if soup.find("h1") is None:
+        for level in range(2, 7):
+            tag = soup.find(f"h{level}")
+            if tag is not None:
+                tag.name = "h1"
+                break
+    # 2) promote h3 -> h2 while fewer than 2 h2s
+    while len(soup.find_all("h2")) < 2:
+        h3 = soup.find("h3")
+        if h3 is None:
+            break
+        h3.name = "h2"
+
+
+def _remove_flash(soup: BeautifulSoup) -> None:
+    for obj in soup.find_all("object"):
+        if "application/x-shockwave-flash" in (obj.get("type") or "").lower():
+            obj.replace_with(Comment(" Removed Flash placeholder "))
+
+
+def _ensure_basics_into(soup: BeautifulSoup) -> None:
+    """Apply the structural (content-free) fixes: lang / viewport / heading hierarchy / remove Flash."""
+    _ensure_lang(soup)
+    _ensure_viewport(soup)
+    _ensure_heading_hierarchy(soup)
+    _remove_flash(soup)
+
 
 def ensure_basics(html: str) -> str:
-    # 1) lang
-    html = re.sub(r"<html(?![^>]*\blang=)", '<html lang="en"', html, count=1)
-
-    # 2) viewport
-    if 'name="viewport"' not in html and "name='viewport'" not in html:
-        html = re.sub(r"(<head[^>]*>)", r'\1\n    <meta name="viewport" '
-                      'content="width=device-width, initial-scale=1.0">',
-                      html, count=1)
-
-    # 3) heading hierarchy: promote the first h2-h6 to h1; promote h3 to h2 while fewer than 2 h2s
-    if "<h1" not in html:
-        html = re.sub(r"<h([2-6])([^>]*)>(.*?)</h\1>", r"<h1\2>\3</h1>", html,
-                      count=1, flags=re.S)
-    while len(re.findall(r"<h2\b", html, flags=re.I)) < 2:
-        new = re.sub(r"<h3([^>]*)>(.*?)</h3>", r"<h2\1>\2</h2>", html,
-                     count=1, flags=re.S)
-        if new == html:
-            break
-        html = new
-
-    # 4) remove Flash objects
-    html = re.sub(r"<object[^>]*type=[\"']application/x-shockwave-flash[\"'][^>]*>.*?</object>",
-                  "<!-- Removed Flash placeholder -->", html, flags=re.S)
-
-    return html
+    """Apply only the structural fixes (lang / viewport / h1 / remove Flash), never adding content."""
+    soup = _parse(html)
+    _ensure_basics_into(soup)
+    return str(soup)
 
 
-def _page_title(html: str) -> str:
-    """Extract the page title from <title> or the first <h1> (used for fallback description / JSON-LD)."""
-    for pat in (r"<title[^>]*>(.*?)</title>", r"<h1[^>]*>(.*?)</h1>"):
-        m = re.search(pat, html, flags=re.I | re.S)
-        if m:
-            t = re.sub(r"<[^>]+>", "", m.group(1))
-            t = re.sub(r"\s+", " ", t).replace('"', "'").strip()
+def _page_title(soup: BeautifulSoup) -> str:
+    """Extract the page title from <title> or the first <h1> ('' when neither exists)."""
+    for selector in ("title", "h1"):
+        tag = soup.find(selector)
+        if tag is not None:
+            t = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).replace('"', "'").strip()
             if t:
                 return t
-    return "Web page"
+    return ""
 
 
-def ensure_head_meta(html: str, title: str) -> str:
-    """Fill in meta description and WebSite JSON-LD (derived from title when missing)."""
-    if 'name="description"' not in html and "name='description'" not in html:
-        meta = '<meta name="description" content="' + title + '">'
-        html = re.sub(r"(</head>)", lambda m: meta + "\n" + m.group(1),
-                      html, count=1, flags=re.I)
-    if "application/ld+json" not in html:
-        ld = ('<script type="application/ld+json">\n'
-              '{"@context": "https://schema.org", "@type": "WebSite", "name": '
-              + json.dumps(title, ensure_ascii=False) + '}\n</script>')
-        html = re.sub(r"(</head>)", lambda m: ld + "\n" + m.group(1),
-                      html, count=1, flags=re.I)
-    return html
+def _ensure_head_meta(soup: BeautifulSoup, title: str) -> None:
+    """Add meta description + WebSite JSON-LD (derived from the title) when missing."""
+    if soup.find("meta", attrs={"name": "description"}) is None:
+        meta = soup.new_tag("meta")
+        meta["name"] = "description"
+        meta["content"] = title
+        _ensure_head(soup).append(meta)
+    if soup.find("script", attrs={"type": "application/ld+json"}) is None:
+        ld = soup.new_tag("script")
+        ld["type"] = "application/ld+json"
+        ld.string = json.dumps(
+            {"@context": "https://schema.org", "@type": "WebSite", "name": title},
+            ensure_ascii=False)
+        _ensure_head(soup).append(ld)
 
 
-def ensure_h1(html: str, title: str) -> str:
-    """Add an <h1> derived from the title when the page has no headings at all."""
-    if "<h1" not in html:
-        html = re.sub(r"(<body[^>]*>)", lambda m: m.group(1) + "<h1>" + title + "</h1>",
-                      html, count=1, flags=re.I)
-    return html
+def _ensure_h1(soup: BeautifulSoup, title: str) -> None:
+    """Add an <h1> derived from the title when the page has no h1 at all."""
+    if soup.find("h1") is None:
+        body = soup.find("body")
+        if body is not None:
+            h1 = soup.new_tag("h1")
+            h1.string = title
+            body.insert(0, h1)
 
 
 def finalize(html: str) -> str:
-    """Unified fallback: structural items + generic meta + fallback h1. Also used as a safety net after LLM output."""
-    html = ensure_basics(html)
-    title = _page_title(html)
-    html = ensure_head_meta(html, title)
-    return ensure_h1(html, title)
+    """Unified fallback: structural items + generic meta + fallback h1 (only when a real title/heading exists).
+
+    Also used as a safety net after LLM output. Never fabricates a title: when the page has no
+    <title> and no heading at all, no meta description / JSON-LD / h1 is invented.
+    """
+    soup = _parse(html)
+    _ensure_basics_into(soup)
+    title = _page_title(soup)
+    if not title:
+        print("[warn] no title or heading found; skipping meta description / JSON-LD / h1 "
+              "(refusing to fabricate content)", file=sys.stderr)
+        return str(soup)
+    _ensure_head_meta(soup, title)
+    _ensure_h1(soup, title)
+    return str(soup)
 
 
 def optimize_with_rules(source: str) -> str:
@@ -310,27 +350,23 @@ def optimize_with_rules(source: str) -> str:
 
 # ============ URL constraints: keep the original set + strip fictional resources ============
 
-def extract_urls(html: str) -> set:
-    """Extract all URLs referenced by href / src / action."""
-    return set(re.findall(r'(?:href|src|action)\s*=\s*["\']([^"\']+)["\']', html))
-
-
 def strip_fictional_resources(source: str, html: str) -> str:
     """Remove static-resource references not present in the source (stylesheets / external scripts)."""
-    src_urls = extract_urls(source)
-    # stylesheets: drop <link rel="stylesheet"> whose URL is not in the source
-    html = re.sub(
-        r'<link\b[^>]*rel=["\']stylesheet["\'][^>]*>',
-        lambda m: m.group(0) if (extract_urls(m.group(0)) & src_urls) else "",
-        html, flags=re.I,
-    )
-    # external scripts: drop <script src="..."></script> whose URL is not in the source
-    html = re.sub(
-        r'<script\b[^>]*\bsrc\s*=[^>]*>\s*</script>',
-        lambda m: m.group(0) if (extract_urls(m.group(0)) & src_urls) else "",
-        html, flags=re.I,
-    )
-    return html
+    src_urls = _urls(source)
+    soup = _parse(html)
+    for tag in list(soup.find_all(["link", "script"])):
+        url = None
+        if tag.name == "link":
+            rel = tag.get("rel") or []
+            if isinstance(rel, str):
+                rel = [rel]
+            if "stylesheet" in [r.lower() for r in rel]:
+                url = tag.get("href")
+        elif tag.name == "script":
+            url = tag.get("src")
+        if url and unescape(url) not in src_urls:
+            tag.decompose()
+    return str(soup)
 
 
 def strip_fabricated_content(source: str, html: str) -> str:
@@ -338,27 +374,40 @@ def strip_fabricated_content(source: str, html: str) -> str:
     1. fabricated <a> links (href not in the source URL set)
     2. whole <nav> / <footer> blocks not present in the source
     """
-    src_urls = extract_urls(source)
+    src_urls = _urls(source)
+    soup = _parse(html)
 
-    # 1) remove fabricated links (whole <a>...</a>)
-    def keep_a(m):
-        tag = m.group(0)
-        hrefs = extract_urls(tag)
-        if not hrefs:  # keep <a> without href (e.g. <a name=...>)
-            return tag
-        return tag if all(h in src_urls for h in hrefs) else ""
-    html = re.sub(r'<a\b[^>]*>.*?</a>', keep_a, html, flags=re.I | re.S)
+    # 1) remove fabricated links (an <a> whose href is not in the source)
+    for a in list(soup.find_all("a")):
+        href = a.get("href")
+        if href is not None and unescape(href) not in src_urls:
+            a.decompose()
 
     # 2) remove whole nav / footer blocks not present in the source
-    if "<nav" not in source.lower():
-        html = re.sub(r'<nav\b[^>]*>.*?</nav>', "", html, flags=re.I | re.S)
-    if "<footer" not in source.lower():
-        html = re.sub(r'<footer\b[^>]*>.*?</footer>', "", html, flags=re.I | re.S)
+    src_soup = _parse(source)
+    if src_soup.find("nav") is None:
+        for nav in soup.find_all("nav"):
+            nav.decompose()
+    if src_soup.find("footer") is None:
+        for footer in soup.find_all("footer"):
+            footer.decompose()
 
-    return html
+    return str(soup)
 
 
 # ============ Self-check ============
+
+def _json_ld_valid(html: str) -> bool:
+    """True when every JSON-LD <script> block parses as valid JSON (or there are none)."""
+    soup = _parse(html)
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        text = (script.string or script.get_text()).strip()
+        try:
+            json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    return True
+
 
 CHECKS = [
     ('viewport', 'name="viewport"'),
@@ -369,24 +418,38 @@ CHECKS = [
 ]
 
 
+def _imgs_missing_alt(soup: BeautifulSoup) -> int:
+    return sum(1 for img in soup.find_all("img") if not img.has_attr("alt"))
+
+
 def self_check(source: str, html: str) -> int:
     failed = 0
     print("[self-check] key items of the optimized page:")
-    # lang: the root <html> must have a lang attribute (any value, following the page's actual language)
-    lang_ok = bool(re.search(r"<html[^>]*\blang\s*=\s*[\"']", html, flags=re.I))
+
+    out_soup = _parse(html)
+    src_urls = _urls(source)
+    out_urls = _urls(html)
+
+    lang_ok = out_soup.html is not None and out_soup.html.has_attr("lang")
     print(f"  {'✅' if lang_ok else '❌'} lang attribute")
     if not lang_ok:
         failed += 1
+
     for name, needle in CHECKS:
         # the Flash item should be ABSENT
-        ok = (needle not in html) if name == 'remove Flash' else (needle in html)
+        ok = (needle not in html) if name == "remove Flash" else (needle in html)
         print(f"  {'✅' if ok else '❌'} {name}")
         if not ok:
             failed += 1
 
+    ld_ok = _json_ld_valid(html)
+    print(f"  {'✅' if ld_ok else '❌'} JSON-LD parses as valid JSON")
+    if not ld_ok:
+        failed += 1
+
+    print(f"  ℹ️  images missing alt: {_imgs_missing_alt(_parse(source))} -> {_imgs_missing_alt(out_soup)}")
+
     # original URL set preserved
-    src_urls = extract_urls(source)
-    out_urls = extract_urls(html)
     missing = sorted(u for u in src_urls if u not in out_urls)
     print(f"  {'✅' if not missing else '❌'} all original URLs preserved ({len(src_urls)} total)")
     for u in missing:
@@ -395,8 +458,7 @@ def self_check(source: str, html: str) -> int:
         failed += 1
 
     # fictional resources (new .css/.js references)
-    fictional = sorted(u for u in out_urls - src_urls
-                       if u.lower().endswith((".css", ".js")))
+    fictional = sorted(u for u in out_urls - src_urls if u.lower().endswith((".css", ".js")))
     print(f"  {'✅' if not fictional else '❌'} no new fabricated resources (css/js)")
     for u in fictional:
         print(f"     added: {u}")
@@ -404,7 +466,7 @@ def self_check(source: str, html: str) -> int:
         failed += 1
 
     # new links (every <a> href must come from the source)
-    a_hrefs = set(re.findall(r'<a\b[^>]*href=["\']([^"\']+)["\']', html))
+    a_hrefs = {a.get("href") for a in out_soup.find_all("a") if a.get("href")}
     new_links = sorted(h for h in a_hrefs if h not in src_urls)
     print(f"  {'✅' if not new_links else '❌'} no new links (<a>)")
     for h in new_links:
@@ -415,9 +477,7 @@ def self_check(source: str, html: str) -> int:
     return failed
 
 
-def is_url(s: str) -> bool:
-    return s.startswith("http://") or s.startswith("https://")
-
+# ============ Fetching ============
 
 def fetch_url(url: str) -> str:
     """Fetch a URL's HTML: prefer Playwright to render JS, fall back to urllib when unavailable/failed."""
@@ -462,14 +522,6 @@ def _fetch_urllib(url: str) -> str:
         return data.decode(charset, errors="replace")
 
 
-def url_to_filename(url: str) -> str:
-    """Convert a URL into a safe local filename (without extension)."""
-    u = url.split("#", 1)[0].split("?", 1)[0]
-    u = re.sub(r"^https?://", "", u)
-    u = re.sub(r"[^A-Za-z0-9._-]+", "_", u).strip("_")
-    return u or "page"
-
-
 def main():
     parser = argparse.ArgumentParser(description="Read source HTML + prompt and generate an optimized page")
     parser.add_argument("source", nargs="?", default=str(BASE_DIR / "test.html"),
@@ -494,6 +546,7 @@ def main():
         source = src_path.read_text(encoding="utf-8")
         out_path = Path(args.output) if args.output else \
             src_path.with_name(src_path.stem + "_optimized.html")
+
     prompt = ""
     if Path(args.prompt).exists():
         prompt = Path(args.prompt).read_text(encoding="utf-8")
@@ -519,14 +572,14 @@ def main():
         print("[optimize] using the rule engine ...")
         result = optimize_with_rules(source)
     else:
-        # the LLM only replaced <head>; fill structural items and fallback meta/h1 (body verbatim -> zero URL loss)
+        # the LLM only replaced <head>; fill structural items and fallback meta/h1 as a safety net
         result = finalize(result)
 
     result = strip_fictional_resources(source, result)
     result = strip_fabricated_content(source, result)
 
-    # Safety net: in theory the body is untouched so no URL is lost; fall back to the rule engine otherwise.
-    lost = extract_urls(source) - extract_urls(result)
+    # Safety net: fall back to the rule engine if any original URL was lost.
+    lost = _urls(source) - _urls(result)
     if lost:
         print(f"[warning] output lost {len(lost)} original URLs, switching to the rule engine (keeps all links) ...",
               file=sys.stderr)

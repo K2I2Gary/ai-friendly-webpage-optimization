@@ -1,0 +1,7 @@
+# Runtime dependency for this project (install with: pip install -r requirements.txt)
+openai
+beautifulsoup4
+
+# Optional: render JavaScript before fetching a URL's DOM (URL mode only).
+# playwright
+#   then run: playwright install chromium

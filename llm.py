@@ -8,6 +8,7 @@ This module only:
   2) fills empty fields with defaults from the built-in provider registry (base_url / default model);
   3) applies per-stage overrides (eval / reflect / generate);
   4) returns an OpenAI-compatible client / a unified chat interface.
+  5) falls back to environment variables for the API key (e.g. DEEPSEEK_API_KEY).
 
 Usage (as a library):
     from llm import chat, get_config, list_providers
@@ -19,6 +20,7 @@ To change the model API, edit llm_config.json only, e.g.:
 """
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +46,32 @@ PROVIDERS = {
     "openrouter":  {"base_url": "https://openrouter.ai/api/v1", "model": "openai/gpt-4o-mini"},
     "siliconflow": {"base_url": "https://api.siliconflow.cn/v1", "model": "deepseek-ai/DeepSeek-V3"},
 }
+
+# Environment-variable fallbacks for the API key (llm_config.json's api_key still wins when set).
+API_KEY_ENV_VARS = {
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "zhipu": "ZHIPU_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "siliconflow": "SILICONFLOW_API_KEY",
+}
+GENERIC_KEY_ENV = "LLM_API_KEY"
+
+
+def _env_api_key(provider: str) -> str:
+    """API key from the environment for `provider` ('' if unset).
+
+    Precedence: the provider-specific variable (e.g. DEEPSEEK_API_KEY) wins over the generic
+    LLM_API_KEY; both are only consulted when llm_config.json's api_key is empty.
+    """
+    for name in (API_KEY_ENV_VARS.get(provider, ""), GENERIC_KEY_ENV):
+        if name and os.environ.get(name):
+            return os.environ[name]
+    return ""
 
 
 @dataclass
@@ -102,6 +130,8 @@ def resolve_config(stage: str | None = None) -> LLMConfig:
         api_key = pick(so.get("api_key"), api_key)
 
     meta = PROVIDERS.get(provider, PROVIDERS[DEFAULT_PROVIDER])
+    if not api_key:
+        api_key = _env_api_key(provider)
     return LLMConfig(
         provider=provider,
         model=model or meta["model"],
@@ -115,9 +145,9 @@ _client_cache: dict = {}
 
 
 def get_client(config: LLMConfig | None = None) -> OpenAI:
-    """Return an OpenAI-compatible client (cached by base_url + key)."""
+    """Return an OpenAI-compatible client (cached by base_url + key + compression)."""
     config = config or resolve_config()
-    cache_key = (config.base_url, config.api_key)
+    cache_key = (config.base_url, config.api_key, config.compression)
     if cache_key not in _client_cache:
         if not config.api_key:
             raise ValueError(

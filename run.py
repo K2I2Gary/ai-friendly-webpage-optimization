@@ -30,6 +30,7 @@ import sys
 import time
 from pathlib import Path
 
+from common import console_utf8, is_url, url_to_filename
 from llm import PROVIDERS, DEFAULT_PROVIDER, resolve_config
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,14 +54,6 @@ STAGES = {
 PIPELINE = ["eval", "reflect", "generate"]  # Default pipeline: edit here to recompose
 
 
-def _console_utf8():
-    for s in (sys.stdout, sys.stderr):
-        try:
-            s.reconfigure(encoding="utf-8", line_buffering=True)
-        except Exception:
-            pass
-
-
 def canonical_stages():
     """Dedupe by script and return the canonical stage names (for --list-stages / error hints)."""
     seen, out = set(), []
@@ -79,10 +72,6 @@ def run_step(cmd, label):
         sys.exit(proc.returncode)
 
 
-def is_url(t):
-    return t.startswith("http://") or t.startswith("https://")
-
-
 def kill_tree(proc):
     """Best-effort kill of the process tree (http.server child on Windows)."""
     try:
@@ -94,14 +83,6 @@ def kill_tree(proc):
         proc.terminate()
     except Exception:
         pass
-
-
-def url_to_filename(url: str) -> str:
-    """Convert a URL into a safe local filename (mirrors optimize_page.url_to_filename; keep in sync)."""
-    u = url.split("#", 1)[0].split("?", 1)[0]
-    u = re.sub(r"^https?://", "", u)
-    u = re.sub(r"[^A-Za-z0-9._-]+", "_", u).strip("_")
-    return u or "page"
 
 
 def generated_output(target: str) -> Path:
@@ -130,9 +111,22 @@ class LocalServer:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             self._procs[directory] = (port, proc)
-            time.sleep(2)
+            self._wait_ready(port, proc)
         port, _ = self._procs[directory]
         return f"http://127.0.0.1:{port}/{path.name}"
+
+    def _wait_ready(self, port: int, proc, timeout: float = 5.0) -> None:
+        """Poll until the http.server accepts connections (bail early if the process exits)."""
+        import socket
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                    return
+            except OSError:
+                time.sleep(0.1)
 
     def stop_all(self):
         for _, (_, proc) in self._procs.items():
@@ -141,8 +135,12 @@ class LocalServer:
 
 
 def parse_pipeline(text: str) -> list:
-    """Parse 'eval,reflect,generate' / 'eval->reflect->generate' into a list of stage names."""
-    return [s for s in re.split(r"[,>\s-]+", text) if s]
+    """Parse 'eval,reflect,generate' / 'eval->reflect->generate' into a list of stage names.
+
+    `->` is normalized to `,` first, so hyphens are NOT separators and future stage names may
+    legitimately contain them.
+    """
+    return [s for s in re.split(r"[,>\s]+", text.replace("->", ",")) if s]
 
 
 def run_pipeline(pipeline, target, server):
@@ -164,7 +162,7 @@ def run_pipeline(pipeline, target, server):
 
 
 def main():
-    _console_utf8()
+    console_utf8()
     parser = argparse.ArgumentParser(description="One-shot run of the evaluate->reflect->optimize workflow")
     parser.add_argument("target", nargs="?",
                         help="local HTML file path, or http(s) URL")
