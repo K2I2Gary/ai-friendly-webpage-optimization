@@ -1,0 +1,26 @@
+# x-robots-tag does not block agents
+
+> The X-Robots-Tag header is the response-header equivalent of a meta robots tag. Setting noindex, noai, or noimageai on it tells AI ingesters to skip the page entirely Often inadvertently, when the directive was meant for a different file type.
+
+`page` | `HTTP` | `impl 1.0.0` | `http.no-noindex-noai`
+
+## How the check decides
+The check reads the response X-Robots-Tag header (lowercased) and asserts it does not contain noindex , noai , or noimageai . Passes if the header is absent or contains none of those tokens. Fails (with the offending tokens) otherwise.
+
+## How to implement it
+Audit your CDN, edge worker, and origin server config for X-Robots-Tag rules. If you’re blocking AI training but not search engines, use a more granular header that targets specific user-agents rather than a blanket noai.
+
+### Pass
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+```
+
+### Fail
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+X-Robots-Tag: noindex, noai
+```

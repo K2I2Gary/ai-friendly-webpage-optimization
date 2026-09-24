@@ -9,7 +9,7 @@ input page / URL
    │
    ▼
 ┌─────────────┐   eval.txt   ┌─────────────┐  prompt.txt  ┌──────────────────┐
-│  ai_eval.py │ ───────────▶ │ reflect.py  │ ───────────▶ │ optimize_page.py  │ ──▶ *_optimized.html
+│  ai_eval.py │ ───────────> │ reflect.py  │ ───────────> │ optimize_page.py  │ ──> *_optimized.html
 │  (evaluate) │              │  (reflect)  │              │  (optimize)       │
 └─────────────┘              └─────────────┘              └──────────────────┘
    a14y CLI + LLM              LLM (rule fallback)           LLM + rule fallback
@@ -32,6 +32,10 @@ input page / URL
 | `llm_config.json` | **Single config source** | provider / model / base_url / api_key / per-stage overrides |
 | `llm_config.example.json` | Config template | a key-less example; copy it to `llm_config.json` |
 | `common.py` | Shared utilities | `console_utf8` / `is_url` / `url_to_filename` / `extract_urls`, used by all scripts |
+| `rag.py` | **RAG knowledge base** | deterministic check-id lookup of fix recipes, grounding the `reflect` stage |
+| `fetch_a14y_docs.py` | Docs crawler | fetches a14y official check docs → `knowledge/docs/` |
+| `ab_test.py` | A/B harness | runs `reflect` with RAG on/off and compares coverage/traceability metrics |
+| `knowledge/` | RAG corpus | `catalog.json` + curated `checks/` + crawled `docs/` + `examples/` (verified prompts) |
 | `requirements.txt` | Python deps | `openai` + `beautifulsoup4` (+ optional `playwright`) |
 | `tests/` | pytest unit tests | cover the page-rewrite helpers (head merge / URL preservation / stripping) |
 | `.gitignore` | Ignore list | ignores `llm_config.json` / `.env` / `__pycache__` / intermediates |
@@ -118,6 +122,9 @@ python run.py --list-stages                 # list available stages
 python run.py test.html --port 9000         # change the local-server port (default 8765)
 python run.py test.html --skip-optimize     # evaluate + reflect only, skip optimize
 python run.py test.html --pipeline "eval,reflect,generate,eval,reflect,generate"  # iterative refinement
+python reflect.py --no-rag                 # reflect without RAG grounding (A/B baseline)
+python ab_test.py eval.txt                 # A/B: reflect with RAG on/off + coverage metrics
+python ab_test.py eval.txt --runs 3        # 3 runs each, averaged
 ```
 
 ---
@@ -161,7 +168,7 @@ python run.py test.html --pipeline "eval->reflect->generate->reflect->generate"
 python run.py --list-stages    # list available stages
 ```
 
-Stage name ↔ script mapping:
+Stage name <-> script mapping:
 
 | Stage | Script | Description |
 |---|---|---|
@@ -245,13 +252,13 @@ Full example (this is the `llm_config.example.json` shipped with the project):
 
 ### Per-stage config (optional; defaults to the global config)
 
-Each of the three stages can use a different provider/model, **also edited in `llm_config.json`** (the `stages` section). Module ↔ stage ↔ API mapping:
+Each of the three stages can use a different provider/model, **also edited in `llm_config.json`** (the `stages` section). Module <-> stage <-> API mapping:
 
 | Module (script) | Stage key | Role | Calls the LLM? |
 |---|---|---|---|
-| `ai_eval.py` | `eval` | scoring + deep analysis | ✅ yes |
-| `reflect.py` | `reflect` | reflect into optimization instructions | ✅ yes (rule engine if no key; aborts on failure) |
-| `optimize_page.py` | `generate` | optimize into the output page | ✅ yes (rule engine if no key; aborts on failure) |
+| `ai_eval.py` | `eval` | scoring + deep analysis | [OK] yes |
+| `reflect.py` | `reflect` | reflect into optimization instructions | [OK] yes (rule engine if no key; aborts on failure) |
+| `optimize_page.py` | `generate` | optimize into the output page | [OK] yes (rule engine if no key; aborts on failure) |
 
 Example: eval uses DeepSeek, reflect uses Tongyi, generate uses OpenAI (each with its own key):
 
@@ -281,6 +288,8 @@ Runs `a14y check <url> -o json` to get the scorecard, condenses the failed/warni
 ### ② Reflect — `reflect.py`
 Parses the scorecard JSON and initial analysis out of `eval.txt`, handles **only `fail`/`warn` checks** (`na` items excluded, never criticized), and uses the LLM to produce an optimization instruction with "P0/P1/P2 priorities + copy-pasteable snippets + acceptance criteria" into `prompt.txt`. With no key it degrades to the built-in rule engine (the `FIX_HINTS` dict) so `prompt.txt` is always produced; with a key configured, a failed call aborts.
 
+**RAG grounding:** before calling the LLM, `reflect` retrieves a fix recipe for every fail/warn check id from `knowledge/` (curated `checks/<id>.md` first, then crawled `docs/<id>.md`) via `rag.retrieve_for_checks`, and injects it into the prompt as a "Reference knowledge" section. This keeps the generated snippets accurate and consistent instead of relying on the model's memory. The rule engine likewise falls back to the same recipes for checks not in `FIX_HINTS`. Pass `--no-rag` to reflect without retrieval (the A/B baseline), and run `ab_test.py eval.txt` to compare the two arms on coverage / traceability metrics.
+
 ### ③ Optimize — `optimize_page.py`
 Reads the source HTML (a local file, or an http(s) URL — URLs use **Playwright** to render JS and fetch the real DOM, falling back to urllib when not installed). The LLM generates new `<head>` metadata (title / meta description / og / JSON-LD / viewport / lang), consulting `prompt.txt` (the a14y findings from reflect) as the priority list, and also outputs a content-aware `<style>` design system (the LLM first identifies the page type — product / article / landing page — and designs for it) plus image `alt` text; the program **merges these back into the original**. The page is parsed and re-serialized with **BeautifulSoup**, so content and links are preserved but formatting / attribute quoting / entity encoding may be normalized (the body is no longer byte-verbatim); **zero original URLs are lost**. Heading hierarchy (1 `<h1>` + ≥2 `<h2>`), removing Flash, and (when the page has no stylesheet of its own) injecting a built-in default design system are handled by the rule engine.
 
@@ -289,8 +298,18 @@ Three programmatic hard constraints run before writing, plus a self-check:
 - **Preserve the original URL set**: the body's content/links are kept; every `href/src/action/iframe src` is preserved (compared after HTML-entity decoding);
 - **No fictional resources**: strip `.css/.js` references not present in the source;
 - **No fabricated content**: strip `<a>` links not in the source, and whole `<nav>`/`<footer>` blocks not in the source.
+- **Semantic JSON-LD**: if the LLM emits a JSON-LD block with no top-level `@type` (e.g. an `@graph`-only block), it is replaced with a flat `WebSite` derived from the real title — such a block parses as JSON but fails the evaluator's "semantic" check otherwise.
 
 The self-check (key items + URL preservation + no fictional resources + no new links) exits `1` if it fails.
+
+### RAG knowledge base — `knowledge/` + `rag.py`
+
+The reflect stage is grounded in a small, versioned knowledge base (see `knowledge/README.md` for the full format):
+
+- `knowledge/catalog.json` — one entry per a14y check id (`name` / `group` / `scope` / `priority` / `unlocks` dependency graph).
+- `knowledge/checks/<id>.md` — curated, hand-written fix recipes (What it checks / How to fix / Gotchas / Acceptance).
+- `knowledge/docs/<id>.md` — the official a14y reference per check, fetched by `fetch_a14y_docs.py` (re-run after a scorecard version bump).
+- `knowledge/examples/<name>.md` — verified historical prompts (frontmatter `check_ids` / `score_before` / `score_after` / `verdict` / `final_score`); `rag.rank_examples` recalls them by BM25 and boosts `verdict: PASS` examples.
 
 ---
 
@@ -320,18 +339,19 @@ python evaluate_result.py test.html test_optimized.html --judge-runs 5 --out-dir
 | `--no-llm` | skip the subjective LLM-judge stage |
 | `--judge-runs N` | judge runs for reliability (default 3) |
 | `--judge-temperature T` | judge sampling temperature (default 0.7) |
-| `--out-dir DIR` | report output dir (default project root) |
+| `--out-dir DIR` | report output dir (default `eval/`) |
 
 Outputs `evaluation_report.json` (machine-readable) and `evaluation_report.md` (summary). The judge reuses `llm_config.json`; add a `stages.judge` override to judge with a different model than the generator.
 
-> **Note:** the injected design system raises the a14y score but *lowers* `html.text-ratio` (more markup), so the `text_ratio_improved` checklist item is often legitimately ❌ — a visual-polish vs text-density tradeoff, not a bug.
+> **Note:** the injected design system raises the a14y score but *lowers* `html.text-ratio` (more markup), so the `text_ratio_improved` checklist item is often legitimately [X] — a visual-polish vs text-density tradeoff, not a bug.
 
 ---
 
 ## Tests
 
 The core page-rewrite helpers (head merge, URL preservation, fabricated-content stripping, alt
-injection, JSON-LD validation, pipeline parsing) have pytest unit tests:
+injection, JSON-LD validation, pipeline parsing), the RAG knowledge base (`rag.py`), and the A/B
+harness metrics (`ab_test.py`) have pytest unit tests:
 
 ```bash
 pip install pytest
@@ -351,3 +371,4 @@ pytest tests/
 7. **Before/after a14y comparison must exclude site-level checks**: this tool only optimizes a single page (page-level) and does not produce `robots.txt` / `llms.txt` / `sitemap` (site-level). Re-scoring the optimized local file always fails those site-level checks and drags the total down; compare page-level checks only.
 8. **Pages with no title and no headings are not padded**: the optimizer refuses to invent a title / description / `<h1>`. For such a page the rule fallback only adds `lang` + `viewport`, and the self-check then fails (`meta description` / `JSON-LD` / `h1 heading`), exiting `1` rather than writing fabricated content. Supply a real `<title>` or heading to get a full optimization.
 9. **The optimized page is re-serialized by BeautifulSoup** (`html.parser`): content and links are preserved, but the output is normalized — tag/attribute names are lower-cased, attribute values are double-quoted, `&` in URLs becomes `&amp;` (functionally identical), and void elements become self-closing. If you need byte-identical output, use the source file rather than the optimized one as the reference for diffing.
+10. **ASCII markers instead of emoji in output**: reports and intermediate files use `[OK]` / `[X]` / `[!]` / `[!!]` / `[i]` instead of emoji (check / cross / warning / burst / info), so they stay readable in GBK/CP936 terminals that can't render emoji.

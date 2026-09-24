@@ -26,6 +26,7 @@ from pathlib import Path
 
 from common import console_utf8
 from llm import chat, get_config
+from rag import read_recipe, retrieve_for_checks
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
 console_utf8()
@@ -35,7 +36,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = BASE_DIR / "eval.txt"
 DEFAULT_OUTPUT = BASE_DIR / "prompt.txt"
 
-STATUS_MARK = {"pass": "✅", "fail": "❌", "warn": "⚠️", "error": "💥", "na": "—"}
+STATUS_MARK = {"pass": "[OK]", "fail": "[X]", "warn": "[!]", "error": "[!!]", "na": "—"}
 
 
 # ============ Step 1: parse eval.txt ============
@@ -134,6 +135,9 @@ Reflection requirements:
 4. Give explicit acceptance criteria: which checks should flip from fail to pass, and the
    target total score.
 5. Respond in English; keep the instruction concise and executable, with no filler or repetition.
+6. If a "Reference knowledge" section is supplied below, base each fix on it: use its exact
+   tags / files / snippets and do not contradict it; fill in any domain-specific placeholders
+   (URLs, titles, dates) from the scorecard.
 
 Output format: Output only the instruction body addressed to the next Agent — no explanation,
 reasoning, or pleasantries. The body must follow this fixed structure:
@@ -142,10 +146,21 @@ reasoning, or pleasantries. The body must follow this fixed structure:
   3. Acceptance criteria (list each check that should turn green)"""
 
 
-def reflect_with_llm(scorecard: dict, analysis: str) -> str:
+def reflect_with_llm(scorecard: dict, analysis: str, use_rag: bool = True) -> str:
     """Reflect on the results with the LLM, returning the instruction text for the next agent."""
     cfg = get_config("reflect")
     user_content = build_digest(scorecard, analysis)
+
+    # RAG: ground the reflection in curated fix recipes / official a14y docs for the failing
+    # checks, so the LLM emits accurate, copy-pasteable snippets instead of guessing.
+    if use_rag:
+        issue_checks = [c for c in collect_checks(scorecard)
+                        if c.get("status") in ("fail", "warn", "error")]
+        refs = retrieve_for_checks(issue_checks)
+        if refs:
+            user_content += "\n\n--- Reference knowledge (retrieved; follow these) ---\n"
+            for r in refs:
+                user_content += f"\n### [{r['group']}] {r['id']}\n{r['content']}\n"
 
     print(f"[reflect] requesting {cfg.provider} (model={cfg.model}) ...")
     return chat(
@@ -284,7 +299,12 @@ def reflect_with_rules(scorecard: dict) -> str:
                 buf.append(f"- Action: {hint['action']}")
                 buf.append("```\n" + hint["code"] + "\n```")
             else:
-                buf.append(f"- Action: fix the '{c.get('name', cid)}' check (see {c.get('docsUrl', 'a14y docs')}).")
+                recipe = read_recipe(cid)  # RAG fallback: curated recipe / crawled docs
+                if recipe:
+                    buf.append(f"- Action: fix '{c.get('name', cid)}' (retrieved recipe below)")
+                    buf.append("```\n" + recipe + "\n```")
+                else:
+                    buf.append(f"- Action: fix the '{c.get('name', cid)}' check (see {c.get('docsUrl', 'a14y docs')}).")
         return buf
 
     ordered = sorted(
@@ -332,6 +352,8 @@ def main():
                         help="output prompt path (default ./prompt.txt)")
     parser.add_argument("--no-llm", action="store_true",
                         help="force the rule engine, skip the LLM")
+    parser.add_argument("--no-rag", action="store_true",
+                        help="disable RAG grounding (retrieval) in the LLM reflection")
     parser.add_argument("--debug", action="store_true", help="print full traceback on LLM failure")
     args = parser.parse_args()
 
@@ -354,7 +376,7 @@ def main():
         cfg = get_config("reflect")
         if cfg.api_key:
             try:
-                prompt_text = reflect_with_llm(scorecard, analysis)
+                prompt_text = reflect_with_llm(scorecard, analysis, use_rag=not args.no_rag)
             except Exception as e:  # noqa: BLE001
                 print(f"[error] LLM reflection failed (key configured, aborting): {e}", file=sys.stderr)
                 if args.debug:

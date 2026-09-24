@@ -129,8 +129,8 @@ def build_user_prompt(scorecard: dict) -> str:
     ]
 
     for c in scorecard.get("siteChecks", []):
-        mark = {"pass": "✅", "fail": "❌", "warn": "⚠️",
-                "error": "💥", "na": "—"}.get(c.get("status"), "?")
+        mark = {"pass": "[OK]", "fail": "[X]", "warn": "[!]",
+                "error": "[!!]", "na": "—"}.get(c.get("status"), "?")
         lines.append(
             f"{mark} [{c.get('group')}] {c.get('id')}: {c.get('name')} — {c.get('message')}"
         )
@@ -139,8 +139,8 @@ def build_user_prompt(scorecard: dict) -> str:
         lines.append("")
         lines.append(f"--- Page checks: {page.get('url')} (HTTP {page.get('status')}) ---")
         for c in page.get("checks", []):
-            mark = {"pass": "✅", "fail": "❌", "warn": "⚠️",
-                    "error": "💥", "na": "—"}.get(c.get("status"), "?")
+            mark = {"pass": "[OK]", "fail": "[X]", "warn": "[!]",
+                    "error": "[!!]", "na": "—"}.get(c.get("status"), "?")
             lines.append(
                 f"{mark} [{c.get('group')}] {c.get('id')}: "
                 f"{c.get('name')} — {c.get('message')}"

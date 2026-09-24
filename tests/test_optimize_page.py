@@ -140,7 +140,7 @@ def test_strip_fabricated_content_keeps_empty_href_anchor():
 
 
 def test_strip_fabricated_content_keeps_regpage_entity_link():
-    # "&amp;regPage" must not be double-decoded into "®Page" (which would drop the link).
+    # "&amp;regPage" must not be double-decoded into "(R)Page" (which would drop the link).
     source = '<html><body><a href="https://m.163.com/r.htm?from=a&amp;regPage=1">x</a></body></html>'
     out = strip_fabricated_content(source, source)
     assert "regPage" in out
@@ -169,3 +169,30 @@ def test_finalize_keeps_existing_style():
     out = finalize(html)
     assert "color:red" in out
     assert "--accent-strong: #4338ca" not in out
+
+
+def test_finalize_replaces_graph_only_jsonld():
+    # an @graph block has no top-level @type -> must be replaced with a flat WebSite
+    html = (
+        '<html><head><title>Hi</title>'
+        '<script type="application/ld+json">{"@context": "https://schema.org", "@graph": []}</script>'
+        '</head><body><h1>x</h1></body></html>'
+    )
+    out = finalize(html, "https://example.com/")
+    assert '"@type": "WebSite"' in out
+    assert '"@graph"' not in out
+    assert '"name": "Hi"' in out
+    assert '"url": "https://example.com/"' in out
+
+
+def test_finalize_keeps_semantic_jsonld():
+    # an already-semantic block (top-level @type) must be left untouched
+    html = (
+        '<html><head><title>Hi</title>'
+        '<script type="application/ld+json">'
+        '{"@context":"https://schema.org","@type":"Article","name":"Hi"}'
+        '</script></head><body><h1>x</h1></body></html>'
+    )
+    out = finalize(html)
+    assert "Article" in out
+    assert "WebSite" not in out

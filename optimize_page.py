@@ -436,6 +436,46 @@ def _ensure_head_meta(soup: BeautifulSoup, title: str) -> None:
         _ensure_head(soup).append(ld)
 
 
+def _jsonld_is_semantic(soup: BeautifulSoup) -> bool:
+    """True when at least one JSON-LD block carries a top-level @context and @type.
+
+    Mirrors evaluate_result's `jsonld_valid_and_semantic` criterion: an @graph-only block
+    (which defers @type to nested nodes) parses as valid JSON but is NOT semantic.
+    """
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        text = (script.string or script.get_text()).strip()
+        try:
+            d = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(d, dict) and d.get("@context") and d.get("@type"):
+            return True
+    return False
+
+
+def _ensure_jsonld_semantic(soup: BeautifulSoup, title: str, url: str | None = None) -> None:
+    """Replace a degenerate JSON-LD (e.g. @graph-only, no top-level @type) with a flat WebSite.
+
+    The LLM sometimes emits a valid-but-not-semantic block like {"@context", "@graph": [...]},
+    which passes a JSON parse check but fails the evaluator's semantic check. When no block is
+    semantic, overwrite the first block with a flat WebSite derived from the real title.
+    """
+    if _jsonld_is_semantic(soup):
+        return
+    scripts = soup.find_all("script", attrs={"type": "application/ld+json"})
+    if not scripts:
+        ld = soup.new_tag("script")
+        ld["type"] = "application/ld+json"
+        _ensure_head(soup).append(ld)
+        scripts = [ld]
+    obj = {"@context": "https://schema.org", "@type": "WebSite", "name": title}
+    if url:
+        obj["url"] = url
+    scripts[0].string = json.dumps(obj, ensure_ascii=False)
+    print("[warn] JSON-LD had no top-level @type (e.g. @graph-only); replaced with a flat WebSite",
+          file=sys.stderr)
+
+
 def _ensure_h1(soup: BeautifulSoup, title: str) -> None:
     """Add an <h1> derived from the title when the page has no h1 at all."""
     if soup.find("h1") is None:
@@ -446,7 +486,7 @@ def _ensure_h1(soup: BeautifulSoup, title: str) -> None:
             body.insert(0, h1)
 
 
-def finalize(html: str) -> str:
+def finalize(html: str, url: str | None = None) -> str:
     """Unified fallback: structural items + generic meta + fallback h1 (only when a real title/heading exists).
 
     Also used as a safety net after LLM output. Never fabricates a title: when the page has no
@@ -460,6 +500,7 @@ def finalize(html: str) -> str:
               "(refusing to fabricate content)", file=sys.stderr)
         return str(soup)
     _ensure_head_meta(soup, title)
+    _ensure_jsonld_semantic(soup, title, url)
     _ensure_h1(soup, title)
     return str(soup)
 
@@ -552,27 +593,27 @@ def self_check(source: str, html: str) -> int:
     out_urls = _urls(html)
 
     lang_ok = out_soup.html is not None and out_soup.html.has_attr("lang")
-    print(f"  {'✅' if lang_ok else '❌'} lang attribute")
+    print(f"  {'[OK]' if lang_ok else '[X]'} lang attribute")
     if not lang_ok:
         failed += 1
 
     for name, needle in CHECKS:
         # the Flash item should be ABSENT
         ok = (needle not in html) if name == "remove Flash" else (needle in html)
-        print(f"  {'✅' if ok else '❌'} {name}")
+        print(f"  {'[OK]' if ok else '[X]'} {name}")
         if not ok:
             failed += 1
 
     ld_ok = _json_ld_valid(html)
-    print(f"  {'✅' if ld_ok else '❌'} JSON-LD parses as valid JSON")
+    print(f"  {'[OK]' if ld_ok else '[X]'} JSON-LD parses as valid JSON")
     if not ld_ok:
         failed += 1
 
-    print(f"  ℹ️  images missing alt: {_imgs_missing_alt(_parse(source))} -> {_imgs_missing_alt(out_soup)}")
+    print(f"  [i]  images missing alt: {_imgs_missing_alt(_parse(source))} -> {_imgs_missing_alt(out_soup)}")
 
     # original URL set preserved
     missing = sorted(u for u in src_urls if u not in out_urls)
-    print(f"  {'✅' if not missing else '❌'} all original URLs preserved ({len(src_urls)} total)")
+    print(f"  {'[OK]' if not missing else '[X]'} all original URLs preserved ({len(src_urls)} total)")
     for u in missing:
         print(f"     missing: {u}")
     if missing:
@@ -580,7 +621,7 @@ def self_check(source: str, html: str) -> int:
 
     # fictional resources (new .css/.js references)
     fictional = sorted(u for u in out_urls - src_urls if u.lower().endswith((".css", ".js")))
-    print(f"  {'✅' if not fictional else '❌'} no new fabricated resources (css/js)")
+    print(f"  {'[OK]' if not fictional else '[X]'} no new fabricated resources (css/js)")
     for u in fictional:
         print(f"     added: {u}")
     if fictional:
@@ -589,7 +630,7 @@ def self_check(source: str, html: str) -> int:
     # new links (every <a> href must come from the source)
     a_hrefs = {a.get("href") for a in out_soup.find_all("a") if a.get("href")}
     new_links = sorted(h for h in a_hrefs if h not in src_urls)
-    print(f"  {'✅' if not new_links else '❌'} no new links (<a>)")
+    print(f"  {'[OK]' if not new_links else '[X]'} no new links (<a>)")
     for h in new_links:
         print(f"     added: {h}")
     if new_links:
@@ -694,7 +735,7 @@ def main():
         result = optimize_with_rules(source)
     else:
         # the LLM only replaced <head>; fill structural items and fallback meta/h1 as a safety net
-        result = finalize(result)
+        result = finalize(result, target_url)
 
     result = strip_fictional_resources(source, result)
     result = strip_fabricated_content(source, result)

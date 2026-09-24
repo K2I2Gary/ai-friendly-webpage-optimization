@@ -44,8 +44,9 @@ from optimize_page import _json_ld_valid, _parse, _urls, fetch_url
 # Windows console defaults to GBK; force stdout/stderr to UTF-8
 console_utf8()
 
-OUTPUT_JSON = BASE_DIR / "evaluation_report.json"
-OUTPUT_MD = BASE_DIR / "evaluation_report.md"
+OUTPUT_DIR = BASE_DIR / "eval"
+OUTPUT_JSON = OUTPUT_DIR / "evaluation_report.json"
+OUTPUT_MD = OUTPUT_DIR / "evaluation_report.md"
 
 # ============ Tunable config (mirrors evaluation_plan.json config_defaults) ============
 OBJECTIVE_WEIGHTS = {"a14y_after": 0.6, "integrity": 0.25, "structural": 0.15}
@@ -573,7 +574,7 @@ def _write_report(report: dict, out_json: Path, out_md: Path):
     subj = report["subjective"]
 
     def yn(v):
-        return "✅" if v else "❌"
+        return "[OK]" if v else "[X]"
 
     lines = [
         "# End-to-End Evaluation Report",
@@ -621,7 +622,7 @@ def _write_report(report: dict, out_json: Path, out_md: Path):
             "|---|---|---|",
         ]
         for d in subj["per_dimension"]:
-            flag = " ⚠️" if d in subj["high_variance_flags"] else ""
+            flag = " [!]" if d in subj["high_variance_flags"] else ""
             lines.append(f"| {d} | {subj['per_dimension'][d]['mean']} "
                          f"| {subj['per_dimension'][d]['std']}{flag} |")
         lines += [
@@ -630,7 +631,7 @@ def _write_report(report: dict, out_json: Path, out_md: Path):
             f"({subj['subjective_score_0to100']}/100)**",
         ]
         if subj["high_variance_flags"]:
-            lines.append(f"⚠️ high-variance dimensions: {subj['high_variance_flags']}")
+            lines.append(f"[!] high-variance dimensions: {subj['high_variance_flags']}")
 
     lines += [
         "",
@@ -655,7 +656,7 @@ def main():
     parser.add_argument("--judge-runs", type=int, default=JUDGE_RUNS, help=f"judge runs (default {JUDGE_RUNS})")
     parser.add_argument("--judge-temperature", type=float, default=JUDGE_TEMPERATURE,
                         help=f"judge temperature (default {JUDGE_TEMPERATURE})")
-    parser.add_argument("--out-dir", default=str(BASE_DIR), help="report output directory")
+    parser.add_argument("--out-dir", default=str(OUTPUT_DIR), help="report output directory (default eval/)")
     parser.add_argument("--port", type=int, default=8765, help="local server base port (default 8765)")
     args = parser.parse_args()
 
