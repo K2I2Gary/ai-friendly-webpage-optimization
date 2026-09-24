@@ -27,6 +27,7 @@ input page / URL
 | `ai_eval.py` | ① Evaluator | `URL` → `eval.txt` (a14y score + LLM deep analysis) |
 | `reflect.py` | ② Reflector | `eval.txt` → `prompt.txt` (optimization instruction) |
 | `optimize_page.py` | ③ Optimizer | `source HTML or URL + prompt.txt` → `*_optimized.html` |
+| `evaluate_result.py` | **End-to-end evaluator** | `source + optimized HTML` → `evaluation_report.json/.md` (objective + LLM-judge scoring) |
 | `llm.py` | **Unified LLM API module** | reads `llm_config.json`, wraps multiple providers for all stages |
 | `llm_config.json` | **Single config source** | provider / model / base_url / api_key / per-stage overrides |
 | `llm_config.example.json` | Config template | a key-less example; copy it to `llm_config.json` |
@@ -37,6 +38,8 @@ input page / URL
 | `test.html` / `test_optimized.html` | Test input / output | — |
 | `eval.txt` / `prompt.txt` | Intermediates | stage ①/② outputs |
 | `sample.json` | Sample data | — |
+| `evaluation_plan.json` | Evaluation spec | the two-part rubric, weights, thresholds & step plan |
+| `eval/` | Evaluation output | generated `evaluation_report.json` / `.md` (gitignored) |
 
 ---
 
@@ -288,6 +291,40 @@ Three programmatic hard constraints run before writing, plus a self-check:
 - **No fabricated content**: strip `<a>` links not in the source, and whole `<nav>`/`<footer>` blocks not in the source.
 
 The self-check (key items + URL preservation + no fictional resources + no new links) exits `1` if it fails.
+
+---
+
+## Evaluating the optimization result (end-to-end)
+
+`evaluate_result.py` evaluates the **final optimized page** against its source with two independent lenses (spec in `evaluation_plan.json`):
+
+1. **Objective scoring** (deterministic, no LLM):
+   - **a14y** — before/after page-level score (`a14y check … -m page`), the delta, and per-check flips. Site-level checks are excluded (this tool only optimizes a single page, see note #7).
+   - **Content integrity (hard gate)** — original URLs preserved, visible-text similarity ≥ 0.95, no fabricated links / css/js / nav / footer. Any failure fails the whole result regardless of scores.
+   - **Structural/metadata completeness** — a 13-item checklist (title / description / og / canonical / lang / viewport / JSON-LD / h1 / h2 / text-ratio), 100 points.
+   - `objective_score = 0.6·a14y_after + 0.25·integrity + 0.15·structural`
+
+2. **Subjective scoring** (LLM-as-judge, 1–5 scale, 3 runs): six dimensions — metadata accuracy, content fidelity, readability improvement, style quality, structured-data quality, overall quality — each with rubric anchors, reported as mean ± std.
+
+`final_score = 0.6·objective + 0.4·subjective`, with a **PASS / FAIL / REVIEW** verdict.
+
+```bash
+python evaluate_result.py test.html test_optimized.html            # full (a14y + LLM judge)
+python evaluate_result.py test.html test_optimized.html --no-llm --skip-a14y   # objective only, offline
+python evaluate_result.py test.html test_optimized.html --judge-runs 5 --out-dir ./eval
+```
+
+| Flag | Effect |
+|---|---|
+| `--skip-a14y` | skip the a14y stage (objective falls back to integrity + structural) |
+| `--no-llm` | skip the subjective LLM-judge stage |
+| `--judge-runs N` | judge runs for reliability (default 3) |
+| `--judge-temperature T` | judge sampling temperature (default 0.7) |
+| `--out-dir DIR` | report output dir (default project root) |
+
+Outputs `evaluation_report.json` (machine-readable) and `evaluation_report.md` (summary). The judge reuses `llm_config.json`; add a `stages.judge` override to judge with a different model than the generator.
+
+> **Note:** the injected design system raises the a14y score but *lowers* `html.text-ratio` (more markup), so the `text_ratio_improved` checklist item is often legitimately ❌ — a visual-polish vs text-density tradeoff, not a bug.
 
 ---
 

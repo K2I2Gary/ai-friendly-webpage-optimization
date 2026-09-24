@@ -17,3 +17,8 @@ eval.txt
 prompt.txt
 *_optimized.html
 agentic_page.html
+
+# ===== 端到端评估输出 =====
+evaluation_report.json
+evaluation_report.md
+eval/

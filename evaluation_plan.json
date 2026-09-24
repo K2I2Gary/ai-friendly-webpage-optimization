@@ -1,0 +1,257 @@
+{
+  "schema_version": "1.0",
+  "title": "End-to-End Evaluation Plan for the Page Optimization Result",
+  "title_zh": "页面优化结果端到端评估方案",
+  "created_at": "2026-09-24",
+  "pipeline_context": {
+    "project": "Agentic Page Optimization Workflow (a14y)",
+    "flow": "evaluate (ai_eval.py) -> reflect (reflect.py) -> optimize (optimize_page.py)",
+    "evaluation_subject": "the final optimized page (e.g. test_optimized.html)",
+    "reference_baseline": "the original source page (e.g. test.html)"
+  },
+  "goal": "End-to-end evaluation of the optimization result across two independent lenses: (A) objective scoring (deterministic, reproducible, no LLM) and (B) agent subjective scoring (LLM-as-judge, rubric-based). Combine both into a single final score + PASS/FAIL/REVIEW verdict.",
+  "inputs": {
+    "original_page": "test.html (or any source HTML/URL)",
+    "optimized_page": "test_optimized.html (or *_optimized.html)"
+  },
+  "constraints": [
+    "a14y before/after comparison must use PAGE-LEVEL checks only; exclude siteChecks (robots.txt/llms.txt/sitemap/AGENTS.md) because the tool optimizes a single page, not the site (README note #7).",
+    "Do NOT do byte-level diffing: the optimizer re-serializes HTML via BeautifulSoup (tag lower-casing, double-quoting, entity encoding, self-closing voids), so structural/text-semantic comparison is required instead (README note #9).",
+    "Content integrity is a HARD GATE: any loss of original URLs, fabricated content, or significant text change invalidates the whole result regardless of scores.",
+    "Subjective judge must be framed neutrally (compare two versions of the same page) and, when possible, use a different model than the generator to reduce self-preference bias."
+  ],
+  "part_a_objective_scoring": {
+    "description": "Deterministic, reproducible, no LLM required. Three sub-metrics -> one objective score.",
+    "a1_a14y_score": {
+      "tool": "a14y CLI (npm install -g a14y)",
+      "method": "run `a14y check <url> -o json -m page` against the original page and the optimized page (served via a local http.server); extract per-page summary.score and per-check statuses.",
+      "scope": "PAGE-LEVEL only: use pages[].summary.score and pages[].checks; ignore the top-level siteChecks.",
+      "outputs": {
+        "a14y_before": 0,
+        "a14y_after": 0,
+        "a14y_delta": 0,
+        "check_flips": {
+          "fail_to_pass": 0,
+          "warn_to_pass": 0,
+          "pass_to_fail": 0,
+          "unchanged_fail": 0,
+          "unchanged_pass": 0
+        }
+      }
+    },
+    "a2_content_integrity": {
+      "description": "HARD GATE. Re-verify independently (port logic from optimize_page.py helpers _parse/_urls, not just trusting its self_check).",
+      "checks": {
+        "urls_preserved": {
+          "method": "set(original_urls) subset of set(optimized_urls), after HTML-entity decoding of href/src/action/iframe-src",
+          "pass_if": "zero lost URLs",
+          "critical": true
+        },
+        "text_preserved": {
+          "method": "strip tags, normalize whitespace, compare original vs optimized body text via difflib.SequenceMatcher ratio (or char-level similarity)",
+          "pass_if": "similarity >= 0.95",
+          "critical": true
+        },
+        "no_fabricated_content": {
+          "method": "no new <a> links, no new <nav>/<footer> blocks, no new .css/.js resource references not present in source",
+          "pass_if": "zero additions",
+          "critical": true
+        }
+      },
+      "score_formula": "integrity_score = 0.3*(100 if urls_preserved else 0) + 0.4*(text_similarity*100) + 0.3*(100 if no_fabricated else 0)"
+    },
+    "a3_structural_metadata": {
+      "description": "Checklist of structural/metadata items the optimizer is expected to deliver (total = 100 points).",
+      "items": [
+        {"id": "title_present", "weight": 10},
+        {"id": "meta_description_ge_50_chars", "weight": 10},
+        {"id": "og_title", "weight": 5},
+        {"id": "og_description", "weight": 5},
+        {"id": "og_url", "weight": 3},
+        {"id": "og_type", "weight": 3},
+        {"id": "canonical", "weight": 6},
+        {"id": "lang_attribute", "weight": 6},
+        {"id": "viewport", "weight": 6},
+        {"id": "jsonld_valid_and_semantic", "weight": 16},
+        {"id": "h1_exactly_one", "weight": 10},
+        {"id": "h2_at_least_two", "weight": 10},
+        {"id": "text_ratio_improved", "weight": 10}
+      ],
+      "score_formula": "structural_score = sum(weight of satisfied items)"
+    },
+    "objective_formula": "objective_score = 0.6 * a14y_after + 0.25 * integrity_score + 0.15 * structural_score",
+    "hard_gate": "if NOT urls_preserved OR text_similarity < 0.95 OR NOT no_fabricated_content -> objective_verdict = FAIL (overrides everything)"
+  },
+  "part_b_subjective_scoring": {
+    "description": "LLM-as-judge, rubric-based quality scoring on a 1-5 scale (5 = best). Each dimension requires a score + one-line justification.",
+    "judge_dimensions": [
+      {
+        "id": "metadata_accuracy",
+        "label": "Do title / meta description / og tags accurately and concisely reflect the page content, with no hallucinated facts?",
+        "rubric": {"1": "fabricated or irrelevant", "3": "partially relevant, minor errors", "5": "precisely reflects content, no hallucination"}
+      },
+      {
+        "id": "content_fidelity",
+        "label": "Is the meaning and information content preserved (nothing important added, removed, or changed)?",
+        "rubric": {"1": "major content lost or changed", "3": "minor phrasing changes only", "5": "content meaning identical"}
+      },
+      {
+        "id": "readability_improvement",
+        "label": "How much clearer / more AI-readable is the optimized page than the original?",
+        "rubric": {"1": "worse or confusing", "3": "moderate clarity gain", "5": "dramatically clearer and better structured"}
+      },
+      {
+        "id": "style_quality",
+        "label": "Is the injected design system appropriate, consistent, responsive, and non-destructive to existing styles?",
+        "rubric": {"1": "broken or conflicting", "3": "acceptable but generic", "5": "cohesive, on-brand, responsive, non-destructive"}
+      },
+      {
+        "id": "structured_data_quality",
+        "label": "Is the JSON-LD semantically correct and grounded in real page content (not fabricated)?",
+        "rubric": {"1": "invalid or irrelevant", "3": "valid but generic / partially wrong", "5": "valid, semantically grounded, rich"}
+      },
+      {
+        "id": "overall_quality",
+        "label": "Holistic judgment: would you ship this optimized page as-is?",
+        "rubric": {"1": "poor", "3": "acceptable", "5": "excellent"}
+      }
+    ],
+    "procedure": {
+      "judge_model": "from llm_config.json (strong model preferred); ideally DIFFERENT from the generator model to reduce self-preference bias",
+      "framing": "neutral: 'compare two versions of the same page' (blind, no mention of which tool produced them)",
+      "input": "original page text + optimized page text side by side (extracted readable text, not raw bytes)",
+      "output_format": "forced JSON: {\"scores\": {\"<dim_id>\": int, ...}, \"justification\": {\"<dim_id>\": str, ...}}",
+      "runs": 3,
+      "temperature": 0.7,
+      "reliability": "compute mean and std per dimension across the 3 runs; flag any dimension with std >= 1.0 for human review"
+    },
+    "aggregation": "subjective_score_1to5 = mean over dimensions of (per-dimension mean); subjective_score_0to100 = subjective_score_1to5 * 20"
+  },
+  "part_c_final_aggregation": {
+    "formula": "final_score = 0.6 * objective_score + 0.4 * subjective_score_0to100",
+    "verdict_rules": {
+      "FAIL": "content-integrity hard gate triggered",
+      "PASS": "final_score >= 70 AND objective_score >= 70 AND subjective_score_1to5 >= 3.5",
+      "REVIEW": "otherwise (meets part but not all thresholds, or high judge variance)"
+    },
+    "weights_note": "0.6/0.4 and all thresholds are defaults; store them in a single config block so they can be tuned per run"
+  },
+  "steps": [
+    {
+      "step": 1,
+      "title": "Preparation & prerequisite checks",
+      "goal": "Confirm inputs exist and tooling is available before scoring.",
+      "method": "Verify original_page and optimized_page exist; verify `a14y` on PATH (npm install -g a14y); verify llm_config.json has a key for the judge stage; start a local http.server to expose both HTML files as URLs.",
+      "tool": "python -m http.server (or reuse run.py LocalServer)",
+      "inputs": ["test.html", "test_optimized.html"],
+      "outputs": ["before_url", "after_url"],
+      "acceptance": ["both files readable", "a14y --version returns", "both URLs return HTTP 200"]
+    },
+    {
+      "step": 2,
+      "title": "Objective — a14y score before/after (page-level)",
+      "goal": "Capture the authoritative before/after AI-readability score and the exact checks that flipped.",
+      "method": "Run `a14y check <url> -o json -m page` for before and after; extract pages[].summary.score and diff pages[].checks statuses; ignore siteChecks.",
+      "tool": "a14y CLI",
+      "inputs": ["before_url", "after_url"],
+      "outputs": ["a14y_before", "a14y_after", "a14y_delta", "check_flips"],
+      "acceptance": ["both scorecards parse as JSON", "a14y_delta computed", "flip counts computed"]
+    },
+    {
+      "step": 3,
+      "title": "Objective — content integrity (hard gate)",
+      "goal": "Prove the optimizer did not lose URLs, change meaning, or fabricate content.",
+      "method": "Independently re-verify: URL set inclusion (entity-decoded), normalized text similarity (difflib), and absence of new <a>/<nav>/<footer> and new .css/.js. Reuse optimize_page._parse / _urls.",
+      "tool": "BeautifulSoup + difflib",
+      "inputs": ["test.html", "test_optimized.html"],
+      "outputs": ["urls_preserved", "text_similarity", "no_fabricated_content", "integrity_score"],
+      "acceptance": ["urls_preserved == true", "text_similarity >= 0.95", "no_fabricated_content == true"]
+    },
+    {
+      "step": 4,
+      "title": "Objective — structural & metadata completeness",
+      "goal": "Verify the expected structural/metadata deliverables are all present and valid.",
+      "method": "Parse the optimized page with BeautifulSoup and score the 12-item checklist (part_a.a3_structural_metadata.items), including JSON-LD validity and text-ratio improvement vs the original.",
+      "tool": "BeautifulSoup + json",
+      "inputs": ["test.html", "test_optimized.html"],
+      "outputs": ["per_item_results", "structural_score"],
+      "acceptance": ["all 12 items evaluated", "structural_score computed"]
+    },
+    {
+      "step": 5,
+      "title": "Objective — compute objective score",
+      "goal": "Combine A1/A2/A3 into one objective score and verdict.",
+      "method": "Apply objective_formula; then apply hard_gate to set objective_verdict.",
+      "tool": "none (pure computation)",
+      "inputs": ["a14y_after", "integrity_score", "structural_score"],
+      "outputs": ["objective_score", "objective_verdict"],
+      "acceptance": ["objective_score in [0,100]", "objective_verdict in {PASS, FAIL}"]
+    },
+    {
+      "step": 6,
+      "title": "Subjective — build judge prompt & rubric",
+      "goal": "Prepare a neutral, deterministic judge prompt with the 6-dimension rubric.",
+      "method": "Render the 6 judge_dimensions into a system prompt; extract readable text from original + optimized pages; add forced-JSON output instruction and 1-5 anchors.",
+      "tool": "llm.py (chat/get_config with stage 'judge')",
+      "inputs": ["test.html", "test_optimized.html", "judge_dimensions"],
+      "outputs": ["judge_system_prompt", "judge_user_prompt"],
+      "acceptance": ["rubric fully rendered", "output schema specified"]
+    },
+    {
+      "step": 7,
+      "title": "Subjective — run the judge (N runs)",
+      "goal": "Collect N independent judgments for reliability.",
+      "method": "Call the judge model 3 times (temperature 0.7), parse each forced-JSON response, and validate every dimension has an integer score 1-5.",
+      "tool": "llm.py chat",
+      "inputs": ["judge_system_prompt", "judge_user_prompt"],
+      "outputs": ["judgments[3]"],
+      "acceptance": ["3 valid JSON judgments", "all 6 dimensions scored 1-5 each"]
+    },
+    {
+      "step": 8,
+      "title": "Subjective — aggregate",
+      "goal": "Turn N judgments into one subjective score with reliability flags.",
+      "method": "Per dimension compute mean and std across the 3 runs; subjective_score_1to5 = mean over dimensions; flag dimensions with std >= 1.0.",
+      "tool": "none (pure computation)",
+      "inputs": ["judgments[3]"],
+      "outputs": ["per_dimension_mean_std", "subjective_score_1to5", "subjective_score_0to100", "high_variance_flags"],
+      "acceptance": ["subjective_score in [0,100]", "variance flags reported"]
+    },
+    {
+      "step": 9,
+      "title": "Final aggregation & verdict",
+      "goal": "Merge objective and subjective into a single end-to-end result.",
+      "method": "Apply part_c formula and verdict_rules.",
+      "tool": "none (pure computation)",
+      "inputs": ["objective_score", "objective_verdict", "subjective_score_0to100"],
+      "outputs": ["final_score", "verdict", "rationale"],
+      "acceptance": ["final_score in [0,100]", "verdict in {PASS, FAIL, REVIEW}"]
+    },
+    {
+      "step": 10,
+      "title": "Report generation",
+      "goal": "Persist everything in machine-readable + human-readable form.",
+      "method": "Write evaluation_report.json (all raw metrics, flips, per-dimension rubric, final score, verdict) and evaluation_report.md (before/after scores, flips, integrity pass/fail, rubric table, final score + verdict + recommended follow-ups).",
+      "tool": "json + markdown",
+      "inputs": ["all outputs from steps 2-9"],
+      "outputs": ["evaluation_report.json", "evaluation_report.md"],
+      "acceptance": ["both files written", "JSON parseable", "MD includes final score + verdict"]
+    }
+  ],
+  "outputs": {
+    "files": ["evaluation_report.json", "evaluation_report.md"],
+    "reuse_existing": [
+      "ai_eval.py can produce the a14y scorecard + LLM analysis for each side if a full narrative is wanted",
+      "optimize_page.self_check() already covers a subset of A2/A3 — the evaluator should re-verify independently rather than trust it"
+    ]
+  },
+  "config_defaults": {
+    "objective_weights": {"a14y_after": 0.6, "integrity": 0.25, "structural": 0.15},
+    "final_weights": {"objective": 0.6, "subjective": 0.4},
+    "text_similarity_threshold": 0.95,
+    "pass_thresholds": {"final_score": 70, "objective_score": 70, "subjective_1to5": 3.5},
+    "judge_runs": 3,
+    "judge_temperature": 0.7,
+    "judge_variance_flag": 1.0
+  }
+}
