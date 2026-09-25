@@ -12,10 +12,8 @@ venv/
 # ===== IDE =====
 .idea/
 
-# ===== 工作流中间产物 / 生成输出 =====
-eval.txt
-prompt.txt
-*_optimized.html
+# ===== 工作流中间产物 / 生成输出（统一到 output/ 目录）=====
+output/
 agentic_page.html
 
 # ===== 端到端评估输出 =====

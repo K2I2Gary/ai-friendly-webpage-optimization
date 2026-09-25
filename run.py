@@ -29,8 +29,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
-from common import console_utf8, is_url, url_to_filename
+from common import OUTPUT_DIR, console_utf8, is_url, url_to_filename
 from llm import PROVIDERS, DEFAULT_PROVIDER, resolve_config
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,10 +49,12 @@ STAGES = {
                      label="Evaluate"),
     "reflect":  dict(script="reflect.py",       needs_url=False, produces_page=False,
                      label="Reflect"),
-    "generate": dict(script="optimize_page.py", needs_url=False, produces_page=True,
+    "generate": dict(script="optimize_page.py", needs_url=False, produces_page=True, needs_page=True,
                      label="Generate/Optimize"),
+    "site":     dict(script="generate_site.py", needs_url=False, produces_page=False, needs_page=True,
+                     label="Generate site files"),
 }
-PIPELINE = ["eval", "reflect", "generate"]  # Default pipeline: edit here to recompose
+PIPELINE = ["eval", "reflect", "generate", "site"]  # Default pipeline: edit here to recompose
 
 
 def canonical_stages():
@@ -88,9 +91,9 @@ def kill_tree(proc):
 def generated_output(target: str) -> Path:
     """Infer the generate stage's output path (mirrors optimize_page.py's default naming)."""
     if is_url(target):
-        return BASE_DIR / (url_to_filename(target) + "_optimized.html")
+        return OUTPUT_DIR / (url_to_filename(target) + "_optimized.html")
     src = Path(target)
-    return src.with_name(src.stem + "_optimized.html")
+    return OUTPUT_DIR / (src.stem + "_optimized.html")
 
 
 class LocalServer:
@@ -143,6 +146,13 @@ def parse_pipeline(text: str) -> list:
     return [s for s in re.split(r"[,>\s]+", text.replace("->", ",")) if s]
 
 
+def _site_base_url(target: str, current: str, server) -> str:
+    """Base URL for the site-file stage: the remote origin for URLs, else the local server root."""
+    ref = target if is_url(target) else server.url_for(Path(current))
+    p = urlparse(ref)
+    return f"{p.scheme}://{p.netloc}/"
+
+
 def run_pipeline(pipeline, target, server):
     """Run stages in order; the generate stage advances current_target for later eval reuse."""
     py = sys.executable
@@ -154,9 +164,13 @@ def run_pipeline(pipeline, target, server):
         if meta["needs_url"]:
             url = current if is_url(current) else server.url_for(Path(current))
             run_step([py, str(BASE_DIR / meta["script"]), url], label)
-        elif meta["produces_page"]:
-            run_step([py, str(BASE_DIR / meta["script"]), current], label)
-            current = str(generated_output(current))
+        elif meta.get("needs_page"):
+            cmd = [py, str(BASE_DIR / meta["script"]), current]
+            if stage == "site":
+                cmd += ["--base-url", _site_base_url(target, current, server)]
+            run_step(cmd, label)
+            if meta["produces_page"]:
+                current = str(generated_output(current))
         else:
             run_step([py, str(BASE_DIR / meta["script"])], label)
 
@@ -199,7 +213,8 @@ def main():
     if args.pipeline:
         pipeline = parse_pipeline(args.pipeline)
     if args.skip_optimize:
-        pipeline = [s for s in pipeline if STAGES[s]["script"] != "optimize_page.py"]
+        pipeline = [s for s in pipeline
+                    if STAGES[s]["script"] not in ("optimize_page.py", "generate_site.py")]
 
     unknown = [s for s in pipeline if s not in STAGES]
     if unknown:

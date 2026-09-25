@@ -13,16 +13,16 @@ Metrics are computed locally (no LLM judge):
   flips_annotations   number of "Flips:" traceability annotations
 
 Usage:
-    python ab_test.py eval.txt            # 1 run each (2 LLM calls)
-    python ab_test.py eval.txt --runs 3   # 3 runs each, averaged
-    python ab_test.py eval.txt --out-dir eval/ab
+    python ab_test.py output/eval.txt            # 1 run each (2 LLM calls)
+    python ab_test.py output/eval.txt --runs 3   # 3 runs each, averaged
+    python ab_test.py output/eval.txt --out-dir eval/ab
 """
 
 import argparse
 import re
 from pathlib import Path
 
-from common import console_utf8
+from common import OUTPUT_DIR, console_utf8
 from llm import get_config
 from rag import load_catalog
 from reflect import collect_checks, parse_eval_text, reflect_with_llm
@@ -57,8 +57,8 @@ def _fmt(m: dict) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="A/B test RAG grounding in the reflect stage")
-    parser.add_argument("input", nargs="?", default="eval.txt",
-                        help="eval.txt path (default ./eval.txt)")
+    parser.add_argument("input", nargs="?", default=str(OUTPUT_DIR / "eval.txt"),
+                        help=f"eval.txt path (default {OUTPUT_DIR / 'eval.txt'})")
     parser.add_argument("--runs", type=int, default=1,
                         help="number of A/B repetitions per arm (default 1)")
     parser.add_argument("--out-dir", default="eval/ab",

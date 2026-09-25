@@ -49,7 +49,7 @@ OUTPUT_JSON = OUTPUT_DIR / "evaluation_report.json"
 OUTPUT_MD = OUTPUT_DIR / "evaluation_report.md"
 
 # ============ Tunable config (mirrors evaluation_plan.json config_defaults) ============
-OBJECTIVE_WEIGHTS = {"a14y_after": 0.6, "integrity": 0.25, "structural": 0.15}
+OBJECTIVE_WEIGHTS = {"a14y_page_after": 0.45, "a14y_site_after": 0.15, "integrity": 0.25, "structural": 0.15}
 FINAL_WEIGHTS = {"objective": 0.6, "subjective": 0.4}
 TEXT_SIMILARITY_THRESHOLD = 0.95
 PASS_THRESHOLDS = {"final_score": 70, "objective_score": 70, "subjective_1to5": 3.5}
@@ -224,6 +224,15 @@ def _page_metrics(scorecard: dict) -> dict:
     return {"score": score, "checks": checks}
 
 
+def _site_metrics(scorecard: dict) -> dict:
+    """SITE-LEVEL metrics: siteChecks + flat-pool score over them (pages excluded)."""
+    checks = scorecard.get("siteChecks", [])
+    applicable = [c for c in checks if c.get("status") in ("pass", "fail", "warn", "error")]
+    passed = [c for c in applicable if c.get("status") == "pass"]
+    score = round(len(passed) / len(applicable) * 100) if applicable else None
+    return {"score": score, "checks": checks, "passed": len(passed), "applicable": len(applicable)}
+
+
 def _check_flips(before_checks: list, after_checks: list) -> dict:
     b = {c.get("id"): c.get("status") for c in before_checks}
     a = {c.get("id"): c.get("status") for c in after_checks}
@@ -380,18 +389,20 @@ def _structural(before_html: str, after_html: str) -> dict:
 # ============ A: objective scoring ============
 
 
-def objective_score(a14y_after, integrity, structural) -> tuple:
+def objective_score(a14y_page_after, a14y_site_after, integrity, structural) -> tuple:
     """Return (score, used_weights). Reweights integrity/structural when a14y is unavailable."""
-    if a14y_after is not None:
+    if a14y_page_after is not None:
         w = OBJECTIVE_WEIGHTS
     else:
         denom = OBJECTIVE_WEIGHTS["integrity"] + OBJECTIVE_WEIGHTS["structural"]
         w = {
-            "a14y_after": 0.0,
+            "a14y_page_after": 0.0,
+            "a14y_site_after": 0.0,
             "integrity": OBJECTIVE_WEIGHTS["integrity"] / denom,
             "structural": OBJECTIVE_WEIGHTS["structural"] / denom,
         }
-    score = (w["a14y_after"] * (a14y_after or 0)
+    score = (w["a14y_page_after"] * (a14y_page_after or 0)
+             + w["a14y_site_after"] * (a14y_site_after or 0)
              + w["integrity"] * integrity["integrity_score"]
              + w["structural"] * structural["structural_score"])
     return round(score, 2), w
@@ -569,6 +580,7 @@ def _write_report(report: dict, out_json: Path, out_md: Path):
     out_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
     a14y = report["objective"]["a14y"]
+    a14y_site = report["objective"]["a14y_site"]
     integ = report["objective"]["integrity"]
     struct = report["objective"]["structural"]
     subj = report["subjective"]
@@ -585,9 +597,13 @@ def _write_report(report: dict, out_json: Path, out_md: Path):
         "",
         "## 1. Objective scoring",
         "",
-        "### a14y (page-level only)",
+        "### a14y (page-level)",
         f"- Before: **{a14y['before']}** / After: **{a14y['after']}** / Delta: **{a14y['delta']}**",
         f"- Check flips: {a14y['flips']}",
+        "",
+        "### a14y (site-level: robots.txt / llms.txt / sitemap / AGENTS.md)",
+        f"- Score: **{a14y_site['score']}/100** "
+        f"({a14y_site['passed']}/{a14y_site['applicable']} applicable checks pass)",
         "",
         "### Content integrity (hard gate)",
         f"- URLs preserved: {yn(integ['urls_preserved'])}"
@@ -674,6 +690,7 @@ def main():
     try:
         # --- Step 2: A1 a14y before/after ---
         a14y_before = a14y_after = a14y_delta = None
+        a14y_site_after = a14y_site_passed = a14y_site_applicable = None
         flips = None
         if not args.skip_a14y:
             before_url = args.original if is_url(args.original) else server.url_for(Path(args.original).resolve())
@@ -686,7 +703,14 @@ def main():
                 a14y_before, a14y_after = mb["score"], ma["score"]
                 a14y_delta = (a14y_after - a14y_before) if (a14y_before is not None and a14y_after is not None) else None
                 flips = _check_flips(mb["checks"], ma["checks"])
-                print(f"[2/10] a14y page score: {a14y_before} -> {a14y_after} (delta {a14y_delta})")
+                # Site-level checks are a shared property of the served directory (robots.txt /
+                # llms.txt / sitemap apply to the whole site, not one page), so report the "after"
+                # state as a single score rather than a before/after delta.
+                sm = _site_metrics(sc_after)
+                a14y_site_after = sm["score"]
+                a14y_site_passed, a14y_site_applicable = sm["passed"], sm["applicable"]
+                print(f"[2/10] a14y page: {a14y_before}->{a14y_after} (Δ{a14y_delta}); "
+                      f"site: {a14y_site_after}/100 ({a14y_site_passed}/{a14y_site_applicable} pass)")
             else:
                 print("[2/10] a14y unavailable -> objective falls back to integrity+structural",
                       file=sys.stderr)
@@ -702,7 +726,7 @@ def main():
         print(f"[4/10] structural score: {structural['structural_score']}/100")
 
         # --- Step 5: A objective ---
-        obj_score, used_weights = objective_score(a14y_after, integrity, structural)
+        obj_score, used_weights = objective_score(a14y_after, a14y_site_after, integrity, structural)
         obj_verdict = "FAIL" if integrity["hard_gate_failed"] else "PASS"
         print(f"[5/10] objective score: {obj_score}/100 (verdict {obj_verdict})")
 
@@ -736,6 +760,9 @@ def main():
             "objective": {
                 "a14y": {"before": a14y_before, "after": a14y_after, "delta": a14y_delta,
                          "flips": flips, "available": a14y_after is not None},
+                "a14y_site": {"score": a14y_site_after, "passed": a14y_site_passed,
+                              "applicable": a14y_site_applicable,
+                              "available": a14y_site_after is not None},
                 "integrity": integrity,
                 "structural": structural,
                 "score": obj_score,

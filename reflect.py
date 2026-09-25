@@ -24,17 +24,17 @@ import argparse
 import traceback
 from pathlib import Path
 
-from common import console_utf8
+from common import OUTPUT_DIR, console_utf8
 from llm import chat, get_config
-from rag import read_recipe, retrieve_for_checks
+from rag import rank_examples, read_recipe, retrieve_for_checks
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
 console_utf8()
 
 # ============ Paths & config ============
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = BASE_DIR / "eval.txt"
-DEFAULT_OUTPUT = BASE_DIR / "prompt.txt"
+DEFAULT_INPUT = OUTPUT_DIR / "eval.txt"
+DEFAULT_OUTPUT = OUTPUT_DIR / "prompt.txt"
 
 STATUS_MARK = {"pass": "[OK]", "fail": "[X]", "warn": "[!]", "error": "[!!]", "na": "—"}
 
@@ -161,6 +161,13 @@ def reflect_with_llm(scorecard: dict, analysis: str, use_rag: bool = True) -> st
             user_content += "\n\n--- Reference knowledge (retrieved; follow these) ---\n"
             for r in refs:
                 user_content += f"\n### [{r['group']}] {r['id']}\n{r['content']}\n"
+
+        # Feedback loop: recall similar verified examples (frontmatter verdict PASS is boosted).
+        examples = rank_examples(user_content, top_k=2)
+        if examples:
+            user_content += "\n\n--- Similar verified examples (structure reference only; do not copy URLs/titles) ---\n"
+            for ex in examples:
+                user_content += f"\n### Example `{ex['id']}` (verdict: {ex['verdict']})\n{ex['content'][:2000]}\n"
 
     print(f"[reflect] requesting {cfg.provider} (model={cfg.model}) ...")
     return chat(
@@ -388,6 +395,7 @@ def main():
         prompt_text = reflect_with_rules(scorecard)
 
     out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(prompt_text + "\n", encoding="utf-8")
     print(f"[output] optimization prompt written to {out_path}")
 

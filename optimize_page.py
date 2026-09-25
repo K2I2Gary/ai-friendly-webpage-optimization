@@ -31,14 +31,14 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup, Comment
 
-from common import console_utf8, extract_urls, is_url, url_to_filename
+from common import OUTPUT_DIR, console_utf8, extract_urls, is_url, url_to_filename
 from llm import chat, get_config
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8
 console_utf8()
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_PROMPT = BASE_DIR / "prompt.txt"
+DEFAULT_PROMPT = OUTPUT_DIR / "prompt.txt"
 
 HEAD_SYSTEM_PROMPT = """You are a senior web-page metadata engineer.
 
@@ -699,7 +699,7 @@ def main():
         print(f"[info] fetching URL: {args.source}")
         source = fetch_url(args.source)
         out_path = Path(args.output) if args.output else \
-            BASE_DIR / (url_to_filename(args.source) + "_optimized.html")
+            OUTPUT_DIR / (url_to_filename(args.source) + "_optimized.html")
     else:
         src_path = Path(args.source)
         if not src_path.exists():
@@ -707,7 +707,7 @@ def main():
             sys.exit(1)
         source = src_path.read_text(encoding="utf-8")
         out_path = Path(args.output) if args.output else \
-            src_path.with_name(src_path.stem + "_optimized.html")
+            OUTPUT_DIR / (src_path.stem + "_optimized.html")
 
     prompt = ""
     if Path(args.prompt).exists():
@@ -749,6 +749,7 @@ def main():
         result = strip_fictional_resources(source, result)
         result = strip_fabricated_content(source, result)
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(result + "\n", encoding="utf-8")
     print(f"[output] optimized page written to {out_path}")
 

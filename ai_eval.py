@@ -12,7 +12,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from common import console_utf8
+from common import OUTPUT_DIR, console_utf8
 from llm import chat, get_config
 
 # Windows console defaults to GBK; force stdout/stderr to UTF-8 to avoid garbled output
@@ -20,7 +20,7 @@ console_utf8()
 
 # ============ Config ============
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_FILE = BASE_DIR / "eval.txt"
+OUTPUT_FILE = OUTPUT_DIR / "eval.txt"
 
 # Score -> grade mapping
 GRADE_BANDS = [
@@ -197,6 +197,7 @@ Stats: pass={summary.get('passed')} / fail={summary.get('failed')} /
 {json.dumps(scorecard, indent=2, ensure_ascii=False)}
 """
 
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"[output] report written to {OUTPUT_FILE}")
